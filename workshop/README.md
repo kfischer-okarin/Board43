@@ -202,7 +202,7 @@ Board43にはLEDマトリクス以外にも、6軸IMU（加速度・ジャイロ
 
 このサンプルコードはGitHubで公開しています。ご自身のBoard43でぜひ試してみてください。
 
-https://github.com/smartbank-inc/Board43/workshop/examples
+https://github.com/smartbank-inc/Board43/tree/main/workshop/examples
 
 ### その他の機能
 
