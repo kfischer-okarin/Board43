@@ -180,76 +180,14 @@ DETERMINATION_DATA = \
   "\x00\x00\x05\x01\x75\x00\x13\x04"
 # END SONG
 
-# Pre-convert each song's packed byte String to an Array<Integer>
-# exactly once at load time. MusicPlayer#play swaps references into
-# this hash, so switching tracks at runtime never allocates. Add a
-# new song by appending to both SONGS and TRACK_ORDER.
-SONGS = {
-  megalovania:   MEGALOVANIA_DATA.bytes,
-  determination: DETERMINATION_DATA.bytes,
-}
-TRACK_ORDER = [:megalovania, :determination]
-
 # ================================================================
-# Grid / sprite / timing constants
+# Shared display geometry
 # ================================================================
+# Only GRID_W / GRID_H live at the top level — both scenes address
+# the same physical matrix. Everything else (sprites, colors, gameplay
+# timing, song data) lives inside the scene class that owns it.
 GRID_W = 16
 GRID_H = 16
-
-# 3x2 "red T" downward triangle — compact, leaves room for attacks.
-HEART_SPRITE = ['###', '.#.']
-HEART_W = 3
-HEART_H = 2
-HEART_R = 200
-HEART_G = 0
-HEART_B = 0
-
-CONTROL_REPEAT_MS = 96   # step every ~96 ms while a button is held
-
-# --- Title scene: scrolling Sans-wink sprite ---------------------
-#
-# Sprite is 17 wide × 15 tall (one column wider than the matrix),
-# pre-converted to byte rows so the draw loop is pure index lookup.
-# Glyph codes: '#' = white, 'K' = dark grey, '.' = transparent.
-SANS_SPRITE = [
-  "....KKKKKKKKK....",
-  "..KK#########KK..",
-  ".K#############K.",
-  ".K#############K.",
-  "K###############K",
-  "K##########KKK##K",
-  "K##########KKK##K",
-  "K##KKK##K##KKK##K",
-  ".K#####KKK#####K.",
-  "KK#K#########K#KK",
-  "K##KKKKKKKKKKK##K",
-  "K###K#K#K#K#K###K",
-  ".KK##KKKKKKK##KK.",
-  "...KK#######KK...",
-  ".....KKKKKKK.....",
-]
-SANS_BYTES  = SANS_SPRITE.map { |row| row.bytes }
-SANS_W      = 17
-SANS_H      = 15
-SANS_Y      = 0            # top-align; bottom row stays blank
-SANS_GAP    = GRID_W       # one full blank screen between repeats
-SANS_PERIOD = SANS_W + SANS_GAP
-
-# Byte values of the sprite glyphs (avoids char-compare at runtime).
-C_WHITE = 35  # '#'
-C_GREY  = 75  # 'K'
-
-# Render colors. White pixels render as actual white; "black" pixels
-# render as a very dark grey that just barely lights the LED so the
-# silhouette reads against the unlit (fully off) transparent pixels.
-WHITE_R = 180
-WHITE_G = 180
-WHITE_B = 180
-GREY_R  = 0
-GREY_G  = 0
-GREY_B  = 40
-
-SCROLL_MS_PER_PX = 140  # sprite advances one column every 140 ms
 
 # ================================================================
 # Hardware
@@ -260,53 +198,6 @@ btn_up    = GPIO.new(Board43::GPIO_SW4, GPIO::IN | GPIO::PULL_UP)
 btn_down  = GPIO.new(Board43::GPIO_SW5, GPIO::IN | GPIO::PULL_UP)
 btn_right = GPIO.new(Board43::GPIO_SW6, GPIO::IN | GPIO::PULL_UP)
 buzzer    = PWM.new(Board43::GPIO_BUZZER, frequency: 0, duty: 40)
-
-# ================================================================
-# Drawing helpers
-# ================================================================
-def draw_heart(led, x, y)
-  led.fill(0, 0, 0)
-  row = 0
-  while row < HEART_H
-    bytes = HEART_SPRITE[row].bytes
-    col = 0
-    while col < HEART_W
-      if bytes[col] == 35  # '#'
-        led.set_rgb((y + row) * GRID_W + (x + col), HEART_R, HEART_G, HEART_B)
-      end
-      col += 1
-    end
-    row += 1
-  end
-  led.show
-end
-
-# Draw one frame of the scrolling title. `scroll_x` is the current
-# left-edge offset into the infinite SANS_PERIOD-wide tape (sprite
-# followed by a full blank screen, repeating). We iterate screen
-# columns rather than sprite columns so blank columns cost nothing.
-def draw_title_frame(led, scroll_x)
-  led.fill(0, 0, 0)
-  col = 0
-  while col < GRID_W
-    sprite_col = (col + scroll_x) % SANS_PERIOD
-    if sprite_col < SANS_W
-      row = 0
-      while row < SANS_H
-        code = SANS_BYTES[row][sprite_col]
-        idx  = (SANS_Y + row) * GRID_W + col
-        if code == C_WHITE
-          led.set_rgb(idx, WHITE_R, WHITE_G, WHITE_B)
-        elsif code == C_GREY
-          led.set_rgb(idx, GREY_R, GREY_G, GREY_B)
-        end
-        row += 1
-      end
-    end
-    col += 1
-  end
-  led.show
-end
 
 # ================================================================
 # Scenes
@@ -323,6 +214,50 @@ end
 # Title scene: silent, Sans sprite scrolls right-to-left with a
 # full-screen gap between repeats. SW6 press edge → :main.
 class TitleScene
+  # Sprite is 17 wide × 15 tall (one column wider than the matrix),
+  # pre-converted to byte rows so the draw loop is pure index
+  # lookup. Glyph codes: '#' = white, 'K' = dark grey, '.' = off.
+  SANS_SPRITE = [
+    "....KKKKKKKKK....",
+    "..KK#########KK..",
+    ".K#############K.",
+    ".K#############K.",
+    "K###############K",
+    "K##########KKK##K",
+    "K##########KKK##K",
+    "K##KKK##K##KKK##K",
+    ".K#####KKK#####K.",
+    "KK#K#########K#KK",
+    "K##KKKKKKKKKKK##K",
+    "K###K#K#K#K#K###K",
+    ".KK##KKKKKKK##KK.",
+    "...KK#######KK...",
+    ".....KKKKKKK.....",
+  ]
+  SANS_BYTES  = SANS_SPRITE.map { |row| row.bytes }
+  SANS_W      = 17
+  SANS_H      = 15
+  SANS_Y      = 0            # top-align; bottom row stays blank
+  SANS_GAP    = GRID_W       # one full blank screen between repeats
+  SANS_PERIOD = SANS_W + SANS_GAP
+
+  # Byte values of the sprite glyphs (avoids char-compare at runtime).
+  C_WHITE = 35  # '#'
+  C_GREY  = 75  # 'K'
+
+  # Render colors. White pixels render as actual white; "black"
+  # pixels render as a very dim blue that just barely lights the LED
+  # so the silhouette reads against the (fully off) transparent
+  # pixels.
+  WHITE_R = 180
+  WHITE_G = 180
+  WHITE_B = 180
+  GREY_R  = 0
+  GREY_G  = 0
+  GREY_B  = 40
+
+  SCROLL_MS_PER_PX = 140  # sprite advances one column every 140 ms
+
   def initialize(led, btn_right, buzzer)
     @led       = led
     @btn_right = btn_right
@@ -342,12 +277,40 @@ class TitleScene
       @scroll_accum -= SCROLL_MS_PER_PX
       @scroll_x = (@scroll_x + 1) % SANS_PERIOD
     end
-    draw_title_frame(@led, @scroll_x)
+    render
 
     now_down = @btn_right.low?
     fired = now_down && !@prev_down
     @prev_down = now_down
     fired ? :main : nil
+  end
+
+  # Render the scrolling sprite. We iterate screen columns rather
+  # than sprite columns so blank columns between repeats cost
+  # nothing. `@scroll_x` is the current left-edge offset into the
+  # infinite SANS_PERIOD-wide tape (sprite followed by one full
+  # blank screen, repeating).
+  def render
+    @led.fill(0, 0, 0)
+    col = 0
+    while col < GRID_W
+      sprite_col = (col + @scroll_x) % SANS_PERIOD
+      if sprite_col < SANS_W
+        row = 0
+        while row < SANS_H
+          code = SANS_BYTES[row][sprite_col]
+          idx  = (SANS_Y + row) * GRID_W + col
+          if code == C_WHITE
+            @led.set_rgb(idx, WHITE_R, WHITE_G, WHITE_B)
+          elsif code == C_GREY
+            @led.set_rgb(idx, GREY_R, GREY_G, GREY_B)
+          end
+          row += 1
+        end
+      end
+      col += 1
+    end
+    @led.show
   end
 end
 
@@ -369,6 +332,37 @@ end
 #   once per frame. Movement for L and R is suppressed while the
 #   chord is held.
 class MainScene
+  # 3x2 "red T" downward triangle — compact, leaves room for attacks.
+  HEART_SPRITE = ['###', '.#.']
+  HEART_W = 3
+  HEART_H = 2
+  HEART_R = 200
+  HEART_G = 0
+  HEART_B = 0
+
+  # HP bar occupies the bottom row of the matrix. Heart movement is
+  # clamped to PLAY_H so the heart can't paint over it.
+  HP_ROW = GRID_H - 1
+  HP_MAX = GRID_W
+  HP_R   = 200
+  HP_G   = 200
+  HP_B   = 0
+
+  PLAY_H = GRID_H - 1   # playfield excludes the HP row
+
+  CONTROL_REPEAT_MS = 96   # step every ~96 ms while a button is held
+
+  # Pre-convert each song's packed byte String to an Array<Integer>
+  # exactly once at class-load time. MusicPlayer#play swaps
+  # references into this hash, so switching tracks at runtime never
+  # allocates. Add a new song by appending to both SONGS and
+  # TRACK_ORDER.
+  SONGS = {
+    megalovania:   MEGALOVANIA_DATA.bytes,
+    determination: DETERMINATION_DATA.bytes,
+  }
+  TRACK_ORDER = [:megalovania, :determination]
+
   def initialize(led, btn_left, btn_up, btn_down, btn_right, buzzer)
     @led       = led
     @btn_left  = btn_left
@@ -380,8 +374,9 @@ class MainScene
     @track_ix = 0
     @player.play(SONGS[TRACK_ORDER[@track_ix]])
 
-    @x = (GRID_W - HEART_W) / 2
-    @y = (GRID_H - HEART_H) / 2
+    @x  = (GRID_W - HEART_W) / 2
+    @y  = (PLAY_H - HEART_H) / 2
+    @hp = HP_MAX
 
     @ready_l = 0
     @ready_r = 0
@@ -389,7 +384,7 @@ class MainScene
     @ready_d = 0
     @chord_held = false
 
-    draw_heart(@led, @x, @y)
+    render
   end
 
   def tick(dt)
@@ -443,15 +438,44 @@ class MainScene
     if @btn_down.low?
       @ready_d -= dt
       if @ready_d <= 0
-        @y += 1 if @y < GRID_H - HEART_H
+        @y += 1 if @y < PLAY_H - HEART_H
         @ready_d = CONTROL_REPEAT_MS
       end
     else
       @ready_d = 0
     end
 
-    draw_heart(@led, @x, @y)
+    render
     nil
+  end
+
+  # Full-frame render: clear, HP bar on row HP_ROW, heart sprite.
+  # Draw order matters — HP first, then heart on top — so the heart
+  # visually takes priority if anything ever overlaps it (shouldn't,
+  # since motion is clamped to PLAY_H, but cheap insurance).
+  def render
+    @led.fill(0, 0, 0)
+
+    col = 0
+    while col < @hp
+      @led.set_rgb(HP_ROW * GRID_W + col, HP_R, HP_G, HP_B)
+      col += 1
+    end
+
+    row = 0
+    while row < HEART_H
+      bytes = HEART_SPRITE[row].bytes
+      col = 0
+      while col < HEART_W
+        if bytes[col] == 35  # '#'
+          @led.set_rgb((@y + row) * GRID_W + (@x + col), HEART_R, HEART_G, HEART_B)
+        end
+        col += 1
+      end
+      row += 1
+    end
+
+    @led.show
   end
 end
 
