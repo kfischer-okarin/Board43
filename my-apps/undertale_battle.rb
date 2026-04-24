@@ -191,17 +191,7 @@ SONGS = {
 TRACK_ORDER = [:megalovania, :determination]
 
 # ================================================================
-# Hardware
-# ================================================================
-led       = WS2812.new(pin: Board43::GPIO_LEDOUT, num: 256)
-btn_left  = GPIO.new(Board43::GPIO_SW3, GPIO::IN | GPIO::PULL_UP)
-btn_up    = GPIO.new(Board43::GPIO_SW4, GPIO::IN | GPIO::PULL_UP)
-btn_down  = GPIO.new(Board43::GPIO_SW5, GPIO::IN | GPIO::PULL_UP)
-btn_right = GPIO.new(Board43::GPIO_SW6, GPIO::IN | GPIO::PULL_UP)
-buzzer    = PWM.new(Board43::GPIO_BUZZER, frequency: 0, duty: 40)
-
-# ================================================================
-# Grid / sprite / timing
+# Grid / sprite / timing constants
 # ================================================================
 GRID_W = 16
 GRID_H = 16
@@ -216,6 +206,64 @@ HEART_B = 0
 
 CONTROL_REPEAT_MS = 96   # step every ~96 ms while a button is held
 
+# --- Title scene: scrolling Sans-wink sprite ---------------------
+#
+# Sprite is 17 wide × 15 tall (one column wider than the matrix),
+# pre-converted to byte rows so the draw loop is pure index lookup.
+# Glyph codes: '#' = white, 'K' = dark grey, '.' = transparent.
+SANS_SPRITE = [
+  "....KKKKKKKKK....",
+  "..KK#########KK..",
+  ".K#############K.",
+  ".K#############K.",
+  "K###############K",
+  "K##########KKK##K",
+  "K##########KKK##K",
+  "K##KKK##K##KKK##K",
+  ".K#####KKK#####K.",
+  "KK#K#########K#KK",
+  "K##KKKKKKKKKKK##K",
+  "K###K#K#K#K#K###K",
+  ".KK##KKKKKKK##KK.",
+  "...KK#######KK...",
+  ".....KKKKKKK.....",
+]
+SANS_BYTES  = SANS_SPRITE.map { |row| row.bytes }
+SANS_W      = 17
+SANS_H      = 15
+SANS_Y      = 0            # top-align; bottom row stays blank
+SANS_GAP    = GRID_W       # one full blank screen between repeats
+SANS_PERIOD = SANS_W + SANS_GAP
+
+# Byte values of the sprite glyphs (avoids char-compare at runtime).
+C_WHITE = 35  # '#'
+C_GREY  = 75  # 'K'
+
+# Render colors. White pixels render as actual white; "black" pixels
+# render as a very dark grey that just barely lights the LED so the
+# silhouette reads against the unlit (fully off) transparent pixels.
+WHITE_R = 180
+WHITE_G = 180
+WHITE_B = 180
+GREY_R  = 0
+GREY_G  = 0
+GREY_B  = 40
+
+SCROLL_MS_PER_PX = 140  # sprite advances one column every 140 ms
+
+# ================================================================
+# Hardware
+# ================================================================
+led       = WS2812.new(pin: Board43::GPIO_LEDOUT, num: 256)
+btn_left  = GPIO.new(Board43::GPIO_SW3, GPIO::IN | GPIO::PULL_UP)
+btn_up    = GPIO.new(Board43::GPIO_SW4, GPIO::IN | GPIO::PULL_UP)
+btn_down  = GPIO.new(Board43::GPIO_SW5, GPIO::IN | GPIO::PULL_UP)
+btn_right = GPIO.new(Board43::GPIO_SW6, GPIO::IN | GPIO::PULL_UP)
+buzzer    = PWM.new(Board43::GPIO_BUZZER, frequency: 0, duty: 40)
+
+# ================================================================
+# Drawing helpers
+# ================================================================
 def draw_heart(led, x, y)
   led.fill(0, 0, 0)
   row = 0
@@ -233,69 +281,201 @@ def draw_heart(led, x, y)
   led.show
 end
 
+# Draw one frame of the scrolling title. `scroll_x` is the current
+# left-edge offset into the infinite SANS_PERIOD-wide tape (sprite
+# followed by a full blank screen, repeating). We iterate screen
+# columns rather than sprite columns so blank columns cost nothing.
+def draw_title_frame(led, scroll_x)
+  led.fill(0, 0, 0)
+  col = 0
+  while col < GRID_W
+    sprite_col = (col + scroll_x) % SANS_PERIOD
+    if sprite_col < SANS_W
+      row = 0
+      while row < SANS_H
+        code = SANS_BYTES[row][sprite_col]
+        idx  = (SANS_Y + row) * GRID_W + col
+        if code == C_WHITE
+          led.set_rgb(idx, WHITE_R, WHITE_G, WHITE_B)
+        elsif code == C_GREY
+          led.set_rgb(idx, GREY_R, GREY_G, GREY_B)
+        end
+        row += 1
+      end
+    end
+    col += 1
+  end
+  led.show
+end
+
 # ================================================================
-# Main loop — dt-driven (wall-clock)
+# Scenes
 # ================================================================
 #
-# Architecture:
-#   There is no sleep in the loop. Frame cadence is whatever led.show
-#   (≈8 ms of WS2812 bit-banging for 256 LEDs) plus a few ms of Ruby
-#   happens to be on this hardware — roughly 10-20 ms. We DO NOT try
-#   to estimate that; instead we measure it every frame with
-#   Machine.board_millis (integer ms since boot) and feed the real
-#   elapsed ms (`dt`) to everything that has a timing state.
+# Each scene is a small object with #tick(dt) that advances the
+# scene by one frame and returns either a Symbol (to request a
+# transition to that scene) or nil (to stay). Scene state lives as
+# @ivars so nothing has to be reconstructed per frame.
 #
-# Contract for anything added to this loop:
-#   - All timing state must decrement / accumulate in `dt` units (ms).
-#     Never key timing off "N frames"; frame time is variable.
-#   - `dt` is typically 10-20 ms but can spike; callees must tolerate
-#     that. MusicPlayer#tick uses a `while` loop so multiple short
-#     events that fit inside one dt don't get dropped.
-#   - player.tick is the only thing talking to the buzzer. Don't set
-#     buzzer.frequency elsewhere in this loop.
-#
-# Why dt rather than a fixed tick:
-#   - Music must stay wall-clock correct (tempo is what you'd hear on
-#     a metronome, independent of the interpreter's speed today).
-#   - Lets us change draw cost later (more sprites, attacks) without
-#     having to retune a TICK_MS constant to keep tempo.
+# The outer loop at the bottom of this file owns the dt clock and
+# the scene dispatch. Scenes never loop on their own.
+
+# Title scene: silent, Sans sprite scrolls right-to-left with a
+# full-screen gap between repeats. SW6 press edge → :main.
+class TitleScene
+  def initialize(led, btn_right, buzzer)
+    @led       = led
+    @btn_right = btn_right
+    buzzer.frequency(0)
+
+    @scroll_x     = 0
+    @scroll_accum = 0
+
+    # Seed the edge detector with the current state so a button
+    # already held at boot doesn't instantly skip the title.
+    @prev_down = btn_right.low?
+  end
+
+  def tick(dt)
+    @scroll_accum += dt
+    while @scroll_accum >= SCROLL_MS_PER_PX
+      @scroll_accum -= SCROLL_MS_PER_PX
+      @scroll_x = (@scroll_x + 1) % SANS_PERIOD
+    end
+    draw_title_frame(@led, @scroll_x)
+
+    now_down = @btn_right.low?
+    fired = now_down && !@prev_down
+    @prev_down = now_down
+    fired ? :main : nil
+  end
+end
+
+# Main scene (prototype): SOUL moves under the four-button control,
+# megalovania loops on the buzzer, Left+Right chord toggles tracks.
 #
 # Input model:
-#   Each direction has a `ready_X` countdown in ms. When a button is
-#   released we reset it to 0 so the next fresh press fires on the
-#   very next poll (zero perceived latency). While held, `dt` drains
-#   it; when it reaches 0, we step one cell and reload to
+#   Each direction has a `@ready_X` countdown in ms. When a button
+#   is released we reset it to 0 so the next fresh press fires on
+#   the very next poll (zero perceived latency). While held, `dt`
+#   drains it; when it reaches 0, we step one cell and reload to
 #   CONTROL_REPEAT_MS. This gives snap-to-first-press + smooth
 #   auto-repeat without edge detection state.
 #
 # Debug track toggle:
 #   Left+Right pressed together (a physically-impossible movement
 #   combo) advances TRACK_ORDER by one. Edge-detected via
-#   `chord_held` so the toggle fires once per chord press, not once
-#   per frame. Movement for L and R is suppressed while the chord is
-#   held.
+#   `@chord_held` so the toggle fires once per chord press, not
+#   once per frame. Movement for L and R is suppressed while the
+#   chord is held.
+class MainScene
+  def initialize(led, btn_left, btn_up, btn_down, btn_right, buzzer)
+    @led       = led
+    @btn_left  = btn_left
+    @btn_up    = btn_up
+    @btn_down  = btn_down
+    @btn_right = btn_right
+
+    @player   = MusicPlayer.new(buzzer)
+    @track_ix = 0
+    @player.play(SONGS[TRACK_ORDER[@track_ix]])
+
+    @x = (GRID_W - HEART_W) / 2
+    @y = (GRID_H - HEART_H) / 2
+
+    @ready_l = 0
+    @ready_r = 0
+    @ready_u = 0
+    @ready_d = 0
+    @chord_held = false
+
+    draw_heart(@led, @x, @y)
+  end
+
+  def tick(dt)
+    @player.tick(dt)
+
+    l_down = @btn_left.low?
+    r_down = @btn_right.low?
+
+    if l_down && r_down
+      unless @chord_held
+        @track_ix = (@track_ix + 1) % TRACK_ORDER.length
+        @player.play(SONGS[TRACK_ORDER[@track_ix]])
+        @chord_held = true
+      end
+      @ready_l = 0
+      @ready_r = 0
+    else
+      @chord_held = false
+
+      if l_down
+        @ready_l -= dt
+        if @ready_l <= 0
+          @x -= 1 if @x > 0
+          @ready_l = CONTROL_REPEAT_MS
+        end
+      else
+        @ready_l = 0
+      end
+
+      if r_down
+        @ready_r -= dt
+        if @ready_r <= 0
+          @x += 1 if @x < GRID_W - HEART_W
+          @ready_r = CONTROL_REPEAT_MS
+        end
+      else
+        @ready_r = 0
+      end
+    end
+
+    if @btn_up.low?
+      @ready_u -= dt
+      if @ready_u <= 0
+        @y -= 1 if @y > 0
+        @ready_u = CONTROL_REPEAT_MS
+      end
+    else
+      @ready_u = 0
+    end
+
+    if @btn_down.low?
+      @ready_d -= dt
+      if @ready_d <= 0
+        @y += 1 if @y < GRID_H - HEART_H
+        @ready_d = CONTROL_REPEAT_MS
+      end
+    else
+      @ready_d = 0
+    end
+
+    draw_heart(@led, @x, @y)
+    nil
+  end
+end
+
+# ================================================================
+# Program — single dt-driven outer loop, scenes dispatched inside.
+# ================================================================
 #
-# Resolution limits:
-#   - Music resolution ≈ one frame (10-20 ms). Notes shorter than
-#     ~20 ms on a piezo sound like clicks anyway, so this is fine.
-#   - Input granularity is one cell per CONTROL_REPEAT_MS. Lower the
-#     constant for snappier feel; do not lower past ~1 frame or
-#     button polling will never catch repeats cleanly.
-
-x = (GRID_W - HEART_W) / 2
-y = (GRID_H - HEART_H) / 2
-
-player = MusicPlayer.new(buzzer)
-track_ix = 0
-player.play(SONGS[TRACK_ORDER[track_ix]])
-
-ready_l = 0
-ready_r = 0
-ready_u = 0
-ready_d = 0
-chord_held = false
-
-draw_heart(led, x, y)
+# Frame cadence is whatever led.show (≈8 ms of WS2812 bit-banging
+# for 256 LEDs) plus a few ms of Ruby happens to be on this
+# hardware — roughly 10-20 ms. We don't estimate it; we measure
+# every frame with Machine.board_millis and feed the real elapsed
+# ms (`dt`) to the active scene's #tick.
+#
+# Contract for any Scene#tick:
+#   - All timing state must decrement / accumulate in `dt` units.
+#     Never key timing off "N frames"; frame time is variable.
+#   - `dt` can spike; #tick must tolerate that. MusicPlayer#tick
+#     uses a `while` loop so multiple short events that fit inside
+#     one dt don't get dropped.
+#   - Return a Symbol to request a scene switch, or nil to stay.
+#     Scene construction happens at the frame boundary in the
+#     outer loop, so transitions always start a new scene on a
+#     fresh frame.
+scene = TitleScene.new(led, btn_right, buzzer)
 last_ms = Machine.board_millis
 
 loop do
@@ -303,62 +483,10 @@ loop do
   dt      = now_ms - last_ms
   last_ms = now_ms
 
-  player.tick(dt)
-
-  l_down = btn_left.low?
-  r_down = btn_right.low?
-
-  if l_down && r_down
-    unless chord_held
-      track_ix = (track_ix + 1) % TRACK_ORDER.length
-      player.play(SONGS[TRACK_ORDER[track_ix]])
-      chord_held = true
-    end
-    ready_l = 0
-    ready_r = 0
-  else
-    chord_held = false
-
-    if l_down
-      ready_l -= dt
-      if ready_l <= 0
-        x -= 1 if x > 0
-        ready_l = CONTROL_REPEAT_MS
-      end
-    else
-      ready_l = 0
-    end
-
-    if r_down
-      ready_r -= dt
-      if ready_r <= 0
-        x += 1 if x < GRID_W - HEART_W
-        ready_r = CONTROL_REPEAT_MS
-      end
-    else
-      ready_r = 0
-    end
+  case scene.tick(dt)
+  when :title
+    scene = TitleScene.new(led, btn_right, buzzer)
+  when :main
+    scene = MainScene.new(led, btn_left, btn_up, btn_down, btn_right, buzzer)
   end
-
-  if btn_up.low?
-    ready_u -= dt
-    if ready_u <= 0
-      y -= 1 if y > 0
-      ready_u = CONTROL_REPEAT_MS
-    end
-  else
-    ready_u = 0
-  end
-
-  if btn_down.low?
-    ready_d -= dt
-    if ready_d <= 0
-      y += 1 if y < GRID_H - HEART_H
-      ready_d = CONTROL_REPEAT_MS
-    end
-  else
-    ready_d = 0
-  end
-
-  draw_heart(led, x, y)
 end
