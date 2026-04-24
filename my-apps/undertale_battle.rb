@@ -20,22 +20,36 @@ require 'pwm'
 # MusicPlayer — byte-decoding monophonic song player
 # ================================================================
 #
-# Song data is a byte String with 4 bytes per event:
+# Song data is a packed byte stream with 4 bytes per event:
 #   bytes 0-1: frequency Hz (little-endian, 0 = rest)
 #   bytes 2-3: duration ms  (little-endian)
 # Articulation gaps between same-pitch repeats are baked in already,
 # so #tick does no parsing and no table lookups.
 #
-#   player = MusicPlayer.new(buzzer, SOME_SONG_DATA)
+# Callers pass a pre-converted Array<Integer> (obtained once at boot
+# via `SOME_SONG_DATA.bytes`). The player never allocates during
+# playback or track switching — `#play` just swaps the reference.
+#
+#   player = MusicPlayer.new(buzzer)
+#   player.play(SONGS[:megalovania])
 #   loop do
-#     player.tick(TICK_MS)
+#     player.tick(dt)
 #     # ... draw your frame ...
 #   end
 class MusicPlayer
-  def initialize(buzzer, data)
+  def initialize(buzzer)
     @buzzer    = buzzer
-    @bytes     = data.bytes   # one-time string -> int array
-    @count     = @bytes.length / 4
+    @bytes     = nil
+    @count     = 0
+    @cursor    = 0
+    @remaining = 0
+  end
+
+  # Swap to a different song. `song_bytes` is a pre-converted int
+  # array; no allocation happens here. Safe to call mid-playback.
+  def play(song_bytes)
+    @bytes     = song_bytes
+    @count     = song_bytes.length / 4
     @cursor    = 0
     @remaining = 0
   end
@@ -44,6 +58,7 @@ class MusicPlayer
   # one compare. Uses a while loop so multiple short events that fit
   # inside a single tick don't get dropped.
   def tick(elapsed_ms)
+    return unless @bytes
     @remaining -= elapsed_ms
     while @remaining <= 0
       i = @cursor * 4
@@ -139,6 +154,41 @@ MEGALOVANIA_DATA = \
   "\x00\x00\x3e\x00\x4a\x01\x3e\x00\x00\x00\x3e\x00\x37\x01\x3e\x00\x00\x00\x3e\x00\x26\x01\x3e\x00\x00\x00\x3e\x00\x15\x01\x6b\x03" \
   "\x00\x00\x7d\x00\x37\x01\xe8\x03\x00\x00\xf4\x01"
 # END SONG
+# BEGIN SONG: determination
+# 162 notes -> 162 events, 648 bytes
+DETERMINATION_DATA = \
+  "\x72\x01\x05\x01\x5d\x01\x05\x01\x37\x01\x05\x01\x15\x01\x05\x01\x37\x01\x05\x01\xe9\x00\x05\x01\x06\x01\x05\x01\x00\x00\x05\x01" \
+  "\xd0\x00\x05\x01\x00\x00\x05\x01\x37\x01\x05\x01\x5d\x01\x05\x01\x72\x01\x05\x01\x00\x00\x05\x01\x9f\x01\x05\x01\x00\x00\x05\x01" \
+  "\x2a\x02\x05\x01\x00\x00\x05\x01\xd2\x01\x13\x04\x00\x00\x0a\x02\x72\x01\x05\x01\x5d\x01\x05\x01\x37\x01\x05\x01\x15\x01\x05\x01" \
+  "\x37\x01\x05\x01\xe9\x00\x05\x01\x06\x01\x05\x01\x00\x00\x05\x01\xd0\x00\x05\x01\x00\x00\x05\x01\x9c\x00\x05\x01\xaf\x00\x05\x01" \
+  "\xb9\x00\x05\x01\x00\x00\x05\x01\xaf\x00\x05\x01\x00\x00\x05\x01\x8b\x00\x05\x01\x00\x00\x05\x01\x9c\x00\x13\x04\x00\x00\x0a\x02" \
+  "\x72\x01\x05\x01\x5d\x01\x05\x01\x37\x01\x05\x01\x15\x01\x05\x01\x37\x01\x05\x01\xe9\x00\x05\x01\x06\x01\x05\x01\x00\x00\x05\x01" \
+  "\xd0\x00\x05\x01\x00\x00\x05\x01\x37\x01\x05\x01\x5d\x01\x05\x01\x72\x01\x05\x01\x00\x00\x05\x01\x9f\x01\x05\x01\x00\x00\x05\x01" \
+  "\x2a\x02\x05\x01\x00\x00\x05\x01\xd2\x01\x13\x04\x00\x00\x0a\x02\x72\x01\x05\x01\x5d\x01\x05\x01\x37\x01\x05\x01\x15\x01\x05\x01" \
+  "\x37\x01\x05\x01\xe9\x00\x05\x01\x06\x01\x05\x01\x00\x00\x05\x01\xd0\x00\x05\x01\x00\x00\x05\x01\x9c\x00\x05\x01\xaf\x00\x05\x01" \
+  "\xb9\x00\x05\x01\x00\x00\x05\x01\xaf\x00\x05\x01\x00\x00\x05\x01\x8b\x00\x05\x01\x00\x00\x05\x01\x9c\x00\x13\x04\x00\x00\x0a\x02" \
+  "\x9f\x01\x05\x01\x72\x01\x05\x01\x4a\x01\x05\x01\x37\x01\x05\x01\x15\x01\x05\x01\x4a\x01\x05\x01\x37\x01\x05\x01\x00\x00\x05\x01" \
+  "\xe9\x00\x05\x01\x00\x00\x05\x01\xe9\x00\x05\x01\x37\x01\x05\x01\x9f\x01\x05\x01\x72\x01\x05\x01\x4a\x01\x05\x01\x37\x01\x05\x01" \
+  "\x15\x01\x05\x01\x4a\x01\x05\x01\x37\x01\x0f\x03\x00\x00\x05\x01\x9c\x00\x05\x01\xd0\x00\x05\x01\x15\x01\x05\x01\x06\x01\x05\x01" \
+  "\xe9\x00\x05\x01\xd0\x00\x05\x01\xe9\x00\x05\x01\x06\x01\x05\x01\xe9\x00\x05\x01\x00\x00\x05\x01\x9c\x00\x05\x01\x00\x00\x05\x01" \
+  "\x75\x00\x05\x01\x8b\x00\x05\x01\x9c\x00\x05\x01\x00\x00\x05\x01\xf7\x00\x05\x01\x00\x00\x05\x01\x37\x01\x0a\x02\x26\x01\x13\x04" \
+  "\x00\x00\x0a\x02\x9f\x01\x05\x01\x72\x01\x05\x01\x4a\x01\x05\x01\x37\x01\x05\x01\x15\x01\x05\x01\x4a\x01\x05\x01\x37\x01\x05\x01" \
+  "\x00\x00\x05\x01\xe9\x00\x05\x01\x00\x00\x05\x01\xe9\x00\x05\x01\x37\x01\x05\x01\x9f\x01\x05\x01\x72\x01\x05\x01\x4a\x01\x05\x01" \
+  "\x37\x01\x05\x01\x15\x01\x05\x01\x4a\x01\x05\x01\x37\x01\x0f\x03\x00\x00\x05\x01\x9c\x00\x05\x01\xd0\x00\x05\x01\x15\x01\x05\x01" \
+  "\x06\x01\x05\x01\xe9\x00\x05\x01\xd0\x00\x05\x01\xe9\x00\x05\x01\x06\x01\x05\x01\xe9\x00\x05\x01\x00\x00\x05\x01\x9c\x00\x05\x01" \
+  "\x00\x00\x05\x01\x75\x00\x05\x01\x8b\x00\x05\x01\x9c\x00\x05\x01\x00\x00\x05\x01\x8b\x00\x05\x01\x00\x00\x05\x01\x68\x00\x05\x01" \
+  "\x00\x00\x05\x01\x75\x00\x13\x04"
+# END SONG
+
+# Pre-convert each song's packed byte String to an Array<Integer>
+# exactly once at load time. MusicPlayer#play swaps references into
+# this hash, so switching tracks at runtime never allocates. Add a
+# new song by appending to both SONGS and TRACK_ORDER.
+SONGS = {
+  megalovania:   MEGALOVANIA_DATA.bytes,
+  determination: DETERMINATION_DATA.bytes,
+}
+TRACK_ORDER = [:megalovania, :determination]
 
 # ================================================================
 # Hardware
@@ -218,6 +268,13 @@ end
 #   CONTROL_REPEAT_MS. This gives snap-to-first-press + smooth
 #   auto-repeat without edge detection state.
 #
+# Debug track toggle:
+#   Left+Right pressed together (a physically-impossible movement
+#   combo) advances TRACK_ORDER by one. Edge-detected via
+#   `chord_held` so the toggle fires once per chord press, not once
+#   per frame. Movement for L and R is suppressed while the chord is
+#   held.
+#
 # Resolution limits:
 #   - Music resolution ≈ one frame (10-20 ms). Notes shorter than
 #     ~20 ms on a piezo sound like clicks anyway, so this is fine.
@@ -228,12 +285,15 @@ end
 x = (GRID_W - HEART_W) / 2
 y = (GRID_H - HEART_H) / 2
 
-player = MusicPlayer.new(buzzer, MEGALOVANIA_DATA)
+player = MusicPlayer.new(buzzer)
+track_ix = 0
+player.play(SONGS[TRACK_ORDER[track_ix]])
 
 ready_l = 0
 ready_r = 0
 ready_u = 0
 ready_d = 0
+chord_held = false
 
 draw_heart(led, x, y)
 last_ms = Machine.board_millis
@@ -245,24 +305,39 @@ loop do
 
   player.tick(dt)
 
-  if btn_left.low?
-    ready_l -= dt
-    if ready_l <= 0
-      x -= 1 if x > 0
-      ready_l = CONTROL_REPEAT_MS
-    end
-  else
-    ready_l = 0
-  end
+  l_down = btn_left.low?
+  r_down = btn_right.low?
 
-  if btn_right.low?
-    ready_r -= dt
-    if ready_r <= 0
-      x += 1 if x < GRID_W - HEART_W
-      ready_r = CONTROL_REPEAT_MS
+  if l_down && r_down
+    unless chord_held
+      track_ix = (track_ix + 1) % TRACK_ORDER.length
+      player.play(SONGS[TRACK_ORDER[track_ix]])
+      chord_held = true
     end
-  else
+    ready_l = 0
     ready_r = 0
+  else
+    chord_held = false
+
+    if l_down
+      ready_l -= dt
+      if ready_l <= 0
+        x -= 1 if x > 0
+        ready_l = CONTROL_REPEAT_MS
+      end
+    else
+      ready_l = 0
+    end
+
+    if r_down
+      ready_r -= dt
+      if ready_r <= 0
+        x += 1 if x < GRID_W - HEART_W
+        ready_r = CONTROL_REPEAT_MS
+      end
+    else
+      ready_r = 0
+    end
   end
 
   if btn_up.low?
