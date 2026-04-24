@@ -164,10 +164,6 @@ HEART_R = 200
 HEART_G = 0
 HEART_B = 0
 
-# No sleep: loop cadence is whatever led.show + Ruby work happens to
-# be. We use Machine.board_millis to measure real elapsed ms per frame,
-# so music and input auto-repeat stay wall-clock correct regardless of
-# frame rate.
 CONTROL_REPEAT_MS = 96   # step every ~96 ms while a button is held
 
 def draw_heart(led, x, y)
@@ -188,16 +184,52 @@ def draw_heart(led, x, y)
 end
 
 # ================================================================
-# Main loop
+# Main loop — dt-driven (wall-clock)
 # ================================================================
+#
+# Architecture:
+#   There is no sleep in the loop. Frame cadence is whatever led.show
+#   (≈8 ms of WS2812 bit-banging for 256 LEDs) plus a few ms of Ruby
+#   happens to be on this hardware — roughly 10-20 ms. We DO NOT try
+#   to estimate that; instead we measure it every frame with
+#   Machine.board_millis (integer ms since boot) and feed the real
+#   elapsed ms (`dt`) to everything that has a timing state.
+#
+# Contract for anything added to this loop:
+#   - All timing state must decrement / accumulate in `dt` units (ms).
+#     Never key timing off "N frames"; frame time is variable.
+#   - `dt` is typically 10-20 ms but can spike; callees must tolerate
+#     that. MusicPlayer#tick uses a `while` loop so multiple short
+#     events that fit inside one dt don't get dropped.
+#   - player.tick is the only thing talking to the buzzer. Don't set
+#     buzzer.frequency elsewhere in this loop.
+#
+# Why dt rather than a fixed tick:
+#   - Music must stay wall-clock correct (tempo is what you'd hear on
+#     a metronome, independent of the interpreter's speed today).
+#   - Lets us change draw cost later (more sprites, attacks) without
+#     having to retune a TICK_MS constant to keep tempo.
+#
+# Input model:
+#   Each direction has a `ready_X` countdown in ms. When a button is
+#   released we reset it to 0 so the next fresh press fires on the
+#   very next poll (zero perceived latency). While held, `dt` drains
+#   it; when it reaches 0, we step one cell and reload to
+#   CONTROL_REPEAT_MS. This gives snap-to-first-press + smooth
+#   auto-repeat without edge detection state.
+#
+# Resolution limits:
+#   - Music resolution ≈ one frame (10-20 ms). Notes shorter than
+#     ~20 ms on a piezo sound like clicks anyway, so this is fine.
+#   - Input granularity is one cell per CONTROL_REPEAT_MS. Lower the
+#     constant for snappier feel; do not lower past ~1 frame or
+#     button polling will never catch repeats cleanly.
+
 x = (GRID_W - HEART_W) / 2
 y = (GRID_H - HEART_H) / 2
 
 player = MusicPlayer.new(buzzer, MEGALOVANIA_DATA)
 
-# Per-direction cooldown counters. 0 means "fire on next poll", so a
-# fresh press after release moves immediately, then auto-repeats at
-# CONTROL_REPEAT_MS while held.
 ready_l = 0
 ready_r = 0
 ready_u = 0
@@ -207,8 +239,8 @@ draw_heart(led, x, y)
 last_ms = Machine.board_millis
 
 loop do
-  now_ms = Machine.board_millis
-  dt     = now_ms - last_ms
+  now_ms  = Machine.board_millis
+  dt      = now_ms - last_ms
   last_ms = now_ms
 
   player.tick(dt)
