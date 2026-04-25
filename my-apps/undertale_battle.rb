@@ -336,9 +336,16 @@ class MainScene
   HEART_SPRITE = ['###', '.#.']
   HEART_W = 3
   HEART_H = 2
-  HEART_R = 200
-  HEART_G = 0
-  HEART_B = 0
+
+  # Heart color is driven by mode:
+  #   :red  — free movement (classic Undertale).
+  #   :blue — gravity platformer; vertical input is "jump only".
+  HEART_RED_R  = 200
+  HEART_RED_G  = 0
+  HEART_RED_B  = 0
+  HEART_BLUE_R = 0
+  HEART_BLUE_G = 0
+  HEART_BLUE_B = 200
 
   # HP bar occupies the bottom row of the matrix. Heart movement is
   # clamped to PLAY_H so the heart can't paint over it.
@@ -351,6 +358,33 @@ class MainScene
   PLAY_H = GRID_H - 1   # playfield excludes the HP row
 
   CONTROL_REPEAT_MS = 96   # step every ~96 ms while a button is held
+
+  # --- Blue-mode physics --------------------------------------------
+  #
+  # Vertical position is integrated as a Float (rows; @y_f) and only
+  # truncated to an integer (@y) for rendering.
+  #
+  # Variable-height jump: holding Up lets the upward velocity decay
+  # naturally under gravity; releasing Up while still ascending
+  # zeroes @vy on the spot, so gravity takes over immediately. Short
+  # tap → short hop, full hold → max-height jump. Once released (or
+  # once the apex is reached) the heart is committed to falling all
+  # the way back to the floor — re-pressing Up mid-air is a no-op
+  # because the edge-detected jump trigger only fires while grounded.
+  #
+  # Tuning: a full-hold jump's kinematic peak slightly overshoots 12
+  # rows (= 3/4 of the 16-row screen), and the absolute clamp at
+  # JUMP_PEAK_Y catches the rest. Time to peak ≈ 600 ms, fall back
+  # ≈ 775 ms, total air time ≈ 1.4 s.
+  #
+  #   peak_height = JUMP_V0² / (2 * GRAVITY) = 0.032² / 0.00008 ≈ 12.8
+  #
+  # Integration is semi-implicit Euler (`@vy += g*dt; @y += @vy*dt`),
+  # which is energy-stable for ballistic motion.
+  GRAVITY     = 0.00004          # rows / ms²  (≈ 40 rows/s²)
+  JUMP_V0     = 0.032            # rows / ms   (applied as -JUMP_V0)
+  GROUND_Y    = PLAY_H - HEART_H # heart's @y when standing on the floor
+  JUMP_PEAK_Y = 4                # absolute ceiling for any jump
 
   # Pre-convert each song's packed byte String to an Array<Integer>
   # exactly once at class-load time. MusicPlayer#play swaps
@@ -374,15 +408,22 @@ class MainScene
     @track_ix = 0
     @player.play(SONGS[TRACK_ORDER[@track_ix]])
 
-    @x  = (GRID_W - HEART_W) / 2
-    @y  = (PLAY_H - HEART_H) / 2
-    @hp = HP_MAX
+    # Default to blue mode so the gravity prototype is what comes up
+    # on boot. Switch this to :red to test the free-movement variant.
+    @mode = :blue
 
-    @ready_l = 0
-    @ready_r = 0
-    @ready_u = 0
-    @ready_d = 0
+    @x   = (GRID_W - HEART_W) / 2
+    @y_f = GROUND_Y.to_f   # float source of truth; @y is derived
+    @y   = GROUND_Y
+    @vy  = 0.0             # rows / ms  (negative = upward)
+    @hp  = HP_MAX
+
+    @ready_l    = 0
+    @ready_r    = 0
+    @ready_u    = 0
+    @ready_d    = 0
     @chord_held = false
+    @up_prev    = false    # edge-detect for jump
 
     render
   end
@@ -390,6 +431,22 @@ class MainScene
   def tick(dt)
     @player.tick(dt)
 
+    tick_horizontal(dt)
+    if @mode == :blue
+      tick_vertical_blue(dt)
+    else
+      tick_vertical_red(dt)
+    end
+
+    render
+    nil
+  end
+
+  # Horizontal movement is shared by both modes. Auto-repeat steps
+  # one cell per CONTROL_REPEAT_MS while a button is held; releasing
+  # resets the counter so the next press fires on the very next poll.
+  # Left+Right held together cycles the music track for debug.
+  def tick_horizontal(dt)
     l_down = @btn_left.low?
     r_down = @btn_right.low?
 
@@ -401,30 +458,35 @@ class MainScene
       end
       @ready_l = 0
       @ready_r = 0
+      return
+    end
+    @chord_held = false
+
+    if l_down
+      @ready_l -= dt
+      if @ready_l <= 0
+        @x -= 1 if @x > 0
+        @ready_l = CONTROL_REPEAT_MS
+      end
     else
-      @chord_held = false
-
-      if l_down
-        @ready_l -= dt
-        if @ready_l <= 0
-          @x -= 1 if @x > 0
-          @ready_l = CONTROL_REPEAT_MS
-        end
-      else
-        @ready_l = 0
-      end
-
-      if r_down
-        @ready_r -= dt
-        if @ready_r <= 0
-          @x += 1 if @x < GRID_W - HEART_W
-          @ready_r = CONTROL_REPEAT_MS
-        end
-      else
-        @ready_r = 0
-      end
+      @ready_l = 0
     end
 
+    if r_down
+      @ready_r -= dt
+      if @ready_r <= 0
+        @x += 1 if @x < GRID_W - HEART_W
+        @ready_r = CONTROL_REPEAT_MS
+      end
+    else
+      @ready_r = 0
+    end
+  end
+
+  # Red mode: free vertical movement with the same auto-repeat model
+  # as horizontal. Keeps @y_f in sync so a future mode switch into
+  # blue starts from a sane integer position with zero velocity.
+  def tick_vertical_red(dt)
     if @btn_up.low?
       @ready_u -= dt
       if @ready_u <= 0
@@ -445,14 +507,51 @@ class MainScene
       @ready_d = 0
     end
 
-    render
-    nil
+    @y_f = @y.to_f
+    @vy  = 0.0
+  end
+
+  # Blue mode: gravity is always pulling down; Up edge-press while
+  # grounded launches a jump. No double jump, no fast-fall — a single
+  # ballistic arc that's clamped to JUMP_PEAK_Y (3/4 screen) at the
+  # top and GROUND_Y at the bottom.
+  def tick_vertical_blue(dt)
+    up_down  = @btn_up.low?
+    grounded = @y_f >= GROUND_Y
+
+    # Edge-press while grounded launches a fresh jump.
+    if up_down && !@up_prev && grounded
+      @vy = -JUMP_V0
+    end
+    @up_prev = up_down
+
+    # Variable jump height: releasing Up while still ascending kills
+    # the upward velocity. Gravity then takes over and the heart
+    # falls to the ground — it cannot re-engage the jump until it
+    # lands (the grounded check above guards re-presses in air).
+    if !up_down && @vy < 0
+      @vy = 0.0
+    end
+
+    @vy  += GRAVITY * dt
+    @y_f += @vy * dt
+
+    if @y_f >= GROUND_Y
+      @y_f = GROUND_Y.to_f
+      @vy  = 0.0
+    elsif @y_f <= JUMP_PEAK_Y
+      # Hard ceiling: stop upward motion so gravity can take over.
+      # Don't zero a downward @vy — only kill the upward push.
+      @y_f = JUMP_PEAK_Y.to_f
+      @vy  = 0.0 if @vy < 0
+    end
+
+    @y = @y_f.to_i
   end
 
   # Full-frame render: clear, HP bar on row HP_ROW, heart sprite.
   # Draw order matters — HP first, then heart on top — so the heart
-  # visually takes priority if anything ever overlaps it (shouldn't,
-  # since motion is clamped to PLAY_H, but cheap insurance).
+  # visually takes priority if anything ever overlaps it.
   def render
     @led.fill(0, 0, 0)
 
@@ -462,13 +561,19 @@ class MainScene
       col += 1
     end
 
+    if @mode == :blue
+      hr = HEART_BLUE_R; hg = HEART_BLUE_G; hb = HEART_BLUE_B
+    else
+      hr = HEART_RED_R;  hg = HEART_RED_G;  hb = HEART_RED_B
+    end
+
     row = 0
     while row < HEART_H
       bytes = HEART_SPRITE[row].bytes
       col = 0
       while col < HEART_W
         if bytes[col] == 35  # '#'
-          @led.set_rgb((@y + row) * GRID_W + (@x + col), HEART_R, HEART_G, HEART_B)
+          @led.set_rgb((@y + row) * GRID_W + (@x + col), hr, hg, hb)
         end
         col += 1
       end
