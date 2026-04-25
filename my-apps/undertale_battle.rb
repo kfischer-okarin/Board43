@@ -609,23 +609,6 @@ class MainScene
     @track_ix = 0
     @player.play(SONGS[TRACK_ORDER[@track_ix]])
 
-    # Start in red mode; the timeline switches to blue at t=2000.
-    @mode = :red
-
-    @x   = (GRID_W - HEART_W) / 2
-    cy   = (PLAY_H - HEART_H) / 2  # spawn centered in the playfield
-    @y_f = cy.to_f                 # float source of truth; @y is derived
-    @y   = cy
-    @vy  = 0.0                     # rows / ms  (negative = upward)
-    @hp  = HP_MAX
-
-    @ready_l    = 0
-    @ready_r    = 0
-    @ready_u    = 0
-    @ready_d    = 0
-    @chord_held = false
-    @up_prev    = false    # edge-detect for jump
-
     # Active hazard objects. Each one ducks into:
     #   #tick(dt)         — advance internal state
     #   #finished?        — true when ready for cleanup
@@ -646,16 +629,58 @@ class MainScene
     # number of fires per frame so we can deduct HP accordingly.
     @damage_trigger = ThrottledTrigger.new(DAMAGE_INTERVAL_MS)
 
-    # Timeline cursor.
+    # Edge-detect for the Up+Down reset chord. Tracked here (not
+    # in reset_scene) so the latch survives a reset — otherwise the
+    # reset would loop on every frame the chord is still held.
+    @reset_held = false
+
+    reset_scene
+    render
+  end
+
+  # Restore the scene to its t=0 state: heart centered in red mode
+  # at full HP, timeline cursor at the first event, every active
+  # hazard dropped. Hardware, audio, the danger buffer, and the
+  # reset-chord latch are persistent and intentionally left alone.
+  # The damage trigger self-resets next frame — heart_overlaps_danger?
+  # will be false because the hazard list was just cleared.
+  def reset_scene
+    @mode = :red
+
+    @x   = (GRID_W - HEART_W) / 2
+    cy   = (PLAY_H - HEART_H) / 2
+    @y_f = cy.to_f
+    @y   = cy
+    @vy  = 0.0
+    @hp  = HP_MAX
+
+    @ready_l    = 0
+    @ready_r    = 0
+    @ready_u    = 0
+    @ready_d    = 0
+    @chord_held = false   # L+R track-toggle chord
+    @up_prev    = false   # blue-mode jump edge
+
+    @hazards.clear
+
     @t        = 0
     @event_ix = 0
-
-    render
   end
 
   def tick(dt)
     # Re-enable after gameplay testing
     # @player.tick(dt)
+
+    # Up+Down chord resets the scene. Edge-detected so it fires
+    # once per chord press, not every frame the chord is held.
+    if @btn_up.low? && @btn_down.low?
+      unless @reset_held
+        reset_scene
+        @reset_held = true
+      end
+    else
+      @reset_held = false
+    end
 
     advance_timeline(dt)
     advance_hazards(dt)
