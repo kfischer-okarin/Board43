@@ -429,7 +429,8 @@ class MainScene
   end
 
   def tick(dt)
-    @player.tick(dt)
+    # Re-enable after gameplay testing
+    # @player.tick(dt)
 
     tick_horizontal(dt)
     if @mode == :blue
