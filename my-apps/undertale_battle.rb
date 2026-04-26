@@ -957,6 +957,71 @@ class MainScene
 end
 
 # ================================================================
+# LiveRepl — dev REPL over USB CDC, ticks once per frame
+# ================================================================
+#
+# Connect a serial terminal (the playground console, `tio`, or
+# `screen /dev/cu.usbmodem*`) and type a line of Ruby + Enter.
+# Lines are compiled and run in a persistent Sandbox that shares
+# globals, top-level constants, and methods with this app, so
+# things like `MainScene::HP_MAX` or `$dbg = scene` work.
+#
+# Caveat: a snippet that loops forever will hang the game until
+# you Ctrl-C in the terminal (which raises Interrupt in the
+# sandbox and unblocks Sandbox#wait).
+class LiveRepl
+  def initialize
+    @sandbox = Sandbox.new('repl')
+    @buf = ''
+    puts '[live-repl ready]'
+  end
+
+  def tick
+    chunk = STDIN.read_nonblock(64)
+    return if chunk.nil? || chunk.empty?
+    # Device-side echo: app runs without a tty echoing for it,
+    # so reflect typed bytes back over the same USB CDC.
+    print chunk
+    @buf << chunk
+    # Same line-splitting shape as upstream picoruby-shell/pipeline.rb:
+    # take 0..idx, then re-bind @buf to the tail. PicoRuby's String
+    # has these range slices but not `slice!`.
+    while (idx = @buf.index("\n") || @buf.index("\r"))
+      line = (@buf[0..idx] || '').chomp.strip
+      @buf = @buf[(idx + 1)..-1] || ''
+      print "\n"
+      eval_line(line) unless line.empty?
+    end
+  rescue => e
+    puts "!! repl(tick): #{e.message} (#{e.class})"
+  end
+
+  private
+
+  # Wrap user code in begin/rescue so any exception lands in `_`
+  # and comes back as the sandbox result — same trick R2P2's irb
+  # uses (see picoruby-ble-uart/example/ble_irb.rb in upstream).
+  def eval_line(line)
+    wrapped = "begin; _ = (#{line}); rescue => _; end; _"
+    unless @sandbox.compile(wrapped)
+      puts '!! syntax error'
+      return
+    end
+    @sandbox.execute
+    @sandbox.wait(timeout: nil)
+    @sandbox.suspend
+    r = @sandbox.result
+    if r.is_a?(Exception)
+      puts "!! #{r.message} (#{r.class})"
+    else
+      puts "=> #{r.inspect}"
+    end
+  rescue => e
+    puts "!! repl(eval): #{e.message} (#{e.class})"
+  end
+end
+
+# ================================================================
 # Program — single dt-driven outer loop, scenes dispatched inside.
 # ================================================================
 #
@@ -977,12 +1042,15 @@ end
 #     outer loop, so transitions always start a new scene on a
 #     fresh frame.
 scene = TitleScene.new(led, btn_right, buzzer)
+repl  = LiveRepl.new
 last_ms = Machine.board_millis
 
 loop do
   now_ms  = Machine.board_millis
   dt      = now_ms - last_ms
   last_ms = now_ms
+
+  repl.tick
 
   case scene.tick(dt)
   when :title
