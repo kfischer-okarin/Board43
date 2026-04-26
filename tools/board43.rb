@@ -13,6 +13,8 @@
 #                                                          playground's "Run on Device"
 #   bundle exec ruby board43.rb install <local> [--run]  # upload to /home/app.rb,
 #                                                          which R2P2 auto-loads on boot
+#   bundle exec ruby board43.rb push    <local>...       # upload each <local> to
+#                                                          /home/<basename>
 #
 # Both commands always overwrite the same flash path (no orphaned files
 # accumulate). `run` uses a fixed scratch path so successive iterations
@@ -64,6 +66,7 @@ def dispatch(command, port, options)
   case command
   when 'run'     then run_command(port, options)
   when 'install' then install_command(port, options)
+  when 'push'    then push_command(port, options)
   when 'shell'   then shell_command(port, options)
   else                abort "unknown command: #{command}"
   end
@@ -89,6 +92,13 @@ def install_command(port, options)
   upload(port, local, STARTUP_PATH)
   warn "✓ installed as startup (#{STARTUP_PATH})"
   exec_remote(port, STARTUP_PATH) if options[:run]
+end
+
+def push_command(port, _options)
+  abort 'push: at least one <local> required' if ARGV.empty?
+  while (local = ARGV.shift)
+    upload(port, local, "/home/#{File.basename(local)}")
+  end
 end
 
 def shell_command(port, _options)
@@ -300,6 +310,7 @@ def usage_banner
     Commands:
       run     <local>           Upload <local> to /home/run.rb and execute
       install <local>           Upload <local> to /home/app.rb (auto-runs on boot)
+      push    <local>...        Upload each <local> to /home/<basename>
       shell                     Attach a raw terminal to the device (Ctrl-] to exit)
 
     Options:
