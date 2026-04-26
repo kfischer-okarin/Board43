@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# board43 — thin forwarder for `bundle exec ruby board43.rb`
+# Resolves its own location so it works from any CWD; preserves the
+# caller's CWD so relative path args (e.g. `../my-apps/foo.rb`) resolve
+# the way the user wrote them.
+set -eu
+DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+export BUNDLE_GEMFILE="$DIR/Gemfile"
+exec bundle exec ruby "$DIR/board43.rb" "$@"

@@ -21,6 +21,7 @@
 require 'bundler/setup'
 require 'serialport'
 require 'optparse'
+require 'io/console'
 
 # ── Protocol constants ────────────────────────────────────────────────
 
@@ -46,6 +47,8 @@ TIMEOUT_MS   = 5000
 STARTUP_PATH = '/home/app.rb'
 SCRATCH_PATH = '/home/run.rb'
 
+SHELL_EXIT_KEY = 0x1d   # Ctrl-]
+
 # ── Top-level entry ───────────────────────────────────────────────────
 
 def main
@@ -63,6 +66,7 @@ def dispatch(command, port, options)
   case command
   when 'run'     then run_command(port, options)
   when 'install' then install_command(port, options)
+  when 'shell'   then shell_command(port, options)
   else                abort "unknown command: #{command}"
   end
 end
@@ -82,6 +86,12 @@ def install_command(port, options)
   exec_remote(port, STARTUP_PATH) if options[:run]
 end
 
+def shell_command(port, _options)
+  warn '· shell — Ctrl-] to exit (Ctrl-C is passed through to the device)'
+  $stdin.raw { run_shell_loop(port) }
+  warn "\n· shell exited"
+end
+
 # ── Workflows ─────────────────────────────────────────────────────────
 
 def upload(port, local, remote)
@@ -94,6 +104,32 @@ def exec_remote(port, remote)
   warn "· running #{remote}"
   sleep 0.4   # let the device redraw the prompt after PicoModem session
   port.write_raw("#{remote}\r")
+end
+
+def run_shell_loop(port)
+  loop do
+    forward_device_to_terminal(port)
+    return if forward_terminal_to_device(port) == :exit
+    sleep 0.005
+  end
+end
+
+def forward_device_to_terminal(port)
+  chunk = port.read_some(4096)
+  return if chunk.empty?
+  # Raw mode disables ONLCR, so bare LF from the device moves down
+  # without returning to column 0. R2P2 emits LF-only via `puts`, so
+  # translate here. (Doubling on existing \r\n is harmless on terminals.)
+  $stdout.write(chunk.gsub("\n", "\r\n"))
+  $stdout.flush
+end
+
+def forward_terminal_to_device(port)
+  bytes = $stdin.read_nonblock(64, exception: false)
+  return nil if bytes == :wait_readable || bytes.nil?
+  return :exit if bytes.bytes.include?(SHELL_EXIT_KEY)
+  port.write_raw(bytes)
+  nil
 end
 
 # ── Session orchestration ────────────────────────────────────────────
@@ -252,6 +288,7 @@ def usage_banner
     Commands:
       run     <local>           Upload <local> to /home/run.rb and execute
       install <local>           Upload <local> to /home/app.rb (auto-runs on boot)
+      shell                     Attach a raw terminal to the device (Ctrl-] to exit)
 
     Options:
   USAGE
@@ -268,8 +305,24 @@ end
 def autodetect_port
   candidates = Dir.glob('/dev/cu.usbmodem*')
   abort 'no USB CDC device found at /dev/cu.usbmodem*' if candidates.empty?
-  warn "multiple devices: #{candidates.inspect} — using first" if candidates.size > 1
-  candidates.first
+  return candidates.first if candidates.size == 1
+  warn "multiple devices found: #{candidates.inspect} — probing for shell"
+  pick_responding_port(candidates) ||
+    abort("none of #{candidates.inspect} responded with a shell prompt; use --port PATH")
+end
+
+def pick_responding_port(candidates)
+  candidates.find { |path| port_has_shell?(path) }
+end
+
+def port_has_shell?(path)
+  warn "  probing #{path}…"
+  port = Port.new(path)
+  begin
+    wait_for_prompt(port, timeout_ms: 1000)
+  ensure
+    port.close
+  end
 end
 
 # ── Helpers ───────────────────────────────────────────────────────────
