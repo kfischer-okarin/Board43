@@ -75,6 +75,11 @@ def run_command(port, _options)
   local = ARGV.shift or abort 'run: <local> required'
   upload(port, local, SCRATCH_PATH)
   exec_remote(port, SCRATCH_PATH)
+  # Auto-attach the shell so the user sees the app's output (puts,
+  # LiveRepl `=> ...`, errors). Ctrl-] to detach.
+  warn '· attaching shell — Ctrl-] to detach (Ctrl-C interrupts the app)'
+  $stdin.raw { run_shell_loop(port) }
+  warn "\n· shell exited"
 end
 
 def install_command(port, options)
@@ -133,15 +138,21 @@ end
 # ── Session orchestration ────────────────────────────────────────────
 
 def enter_session(port)
-  warn '· interrupting any running app'
-  wait_for_prompt(port) or abort 'no shell prompt; is the board on and connected?'
+  warn '· checking for shell prompt'
+  wait_for_prompt(port) or abort <<~MSG
+    no '$> ' prompt within 3 s — the device is probably running an app.
+    Open `tools/board43 shell`, hit Ctrl-C to interrupt it, exit with Ctrl-],
+    then re-run this command. (Auto-sending Ctrl-C from here can crash the
+    firmware mid-frame and reboot the board, so we don't.)
+  MSG
   warn '· starting PicoModem session'
   start_picomodem(port)
 end
 
 def wait_for_prompt(port, timeout_ms: 3000)
-  port.write_raw("\x03")   # interrupt anything running
-  sleep 0.1
+  # Just nudge with Enter — never auto-Ctrl-C. Sending Ctrl-C while the
+  # firmware is mid-task can corrupt VM state and trigger a watchdog
+  # reset. The playground avoids it for the same reason.
   port.write_raw("\r")
   poll_for_prompt(port, timeout_ms)
 end
@@ -301,26 +312,17 @@ def open_port(path)
 end
 
 def autodetect_port
-  candidates = Dir.glob('/dev/cu.usbmodem*')
+  # The board exposes two CDC interfaces (usb_descriptors.c): "PicoRuby
+  # CDC" (the shell, interface 0) and "PicoRuby CDC Debug" (interface
+  # 1). macOS names them /dev/cu.usbmodemXXX1 and …XXX3 respectively,
+  # so the sorted-first one is always the shell.
+  candidates = Dir.glob('/dev/cu.usbmodem*').sort
   abort 'no USB CDC device found at /dev/cu.usbmodem*' if candidates.empty?
-  return candidates.first if candidates.size == 1
-  warn "multiple devices found: #{candidates.inspect} — probing for shell"
-  pick_responding_port(candidates) ||
-    abort("none of #{candidates.inspect} responded with a shell prompt; use --port PATH")
-end
-
-def pick_responding_port(candidates)
-  candidates.find { |path| port_has_shell?(path) }
-end
-
-def port_has_shell?(path)
-  warn "  probing #{path}…"
-  port = Port.new(path)
-  begin
-    wait_for_prompt(port, timeout_ms: 1000)
-  ensure
-    port.close
+  if candidates.size > 1
+    warn "multiple devices: #{candidates.inspect}"
+    warn "  using #{candidates.first} (the higher-numbered ones are the debug CDC)"
   end
+  candidates.first
 end
 
 # ── Helpers ───────────────────────────────────────────────────────────
