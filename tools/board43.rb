@@ -39,10 +39,8 @@ ERROR_CMD = 0xFE
 OK_STATUS = 0x00
 READY     = 0x01
 
-CHUNK_SIZE   = 480     # device-side limit (picomodem.rb)
-TX_BLOCK     = 32      # USB-CDC pacing
-TX_BLOCK_GAP = 0.020   # 20 ms between TX blocks
-TIMEOUT_MS   = 5000
+CHUNK_SIZE = 480     # device-side limit (picomodem.rb)
+TIMEOUT_MS = 5000
 
 STARTUP_PATH = '/home/app.rb'
 SCRATCH_PATH = '/home/run.rb'
@@ -211,7 +209,7 @@ end
 # ── Frame I/O ─────────────────────────────────────────────────────────
 
 def send_frame(port, cmd, payload = ''.b)
-  port.write_paced(build_frame(cmd, payload))
+  port.write_raw(build_frame(cmd, payload))
 end
 
 def expect_frame(port, expected_cmd, ctx)
@@ -362,16 +360,6 @@ class Port
     @sp.read_timeout = 0
     @sp.flow_control = SerialPort::NONE
     @buf = String.new(encoding: Encoding::ASCII_8BIT)
-  end
-
-  def write_paced(bytes)
-    i = 0
-    while i < bytes.bytesize
-      n = [TX_BLOCK, bytes.bytesize - i].min
-      @sp.write(bytes.byteslice(i, n))
-      i += n
-      sleep(TX_BLOCK_GAP) if i < bytes.bytesize
-    end
   end
 
   def write_raw(bytes)
