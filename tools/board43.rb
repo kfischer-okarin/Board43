@@ -71,12 +71,14 @@ end
 
 # ── Subcommands ───────────────────────────────────────────────────────
 
-def run_command(port, _options)
+def run_command(port, options)
   local = ARGV.shift or abort 'run: <local> required'
   upload(port, local, SCRATCH_PATH)
   exec_remote(port, SCRATCH_PATH)
-  # Auto-attach the shell so the user sees the app's output (puts,
-  # LiveRepl `=> ...`, errors). Ctrl-] to detach.
+  attach_shell(port) unless options[:detach]
+end
+
+def attach_shell(port)
   warn '· attaching shell — Ctrl-] to detach (Ctrl-C interrupts the app)'
   $stdin.raw { run_shell_loop(port) }
   warn "\n· shell exited"
@@ -274,7 +276,7 @@ end
 # ── CLI argument parsing ──────────────────────────────────────────────
 
 def parse_args
-  options = { port: nil, run: false }
+  options = { port: nil, run: false, detach: false }
   parser = build_option_parser(options)
   parser.parse!
   command = ARGV.shift or abort parser.to_s
@@ -286,6 +288,7 @@ def build_option_parser(options)
     o.banner = usage_banner
     o.on('-p', '--port PATH', 'serial port (default: auto-detect /dev/cu.usbmodem*)') { |v| options[:port] = v }
     o.on('--run', 'after install, run /home/app.rb immediately') { options[:run] = true }
+    o.on('--detach', "after run, don't attach a shell — disconnect immediately") { options[:detach] = true }
     o.on('-h', '--help') { puts o; exit }
   end
 end
@@ -358,10 +361,8 @@ end
 
 class Port
   def initialize(path)
-    @sp = SerialPort.new(path, 115200, 8, 1, SerialPort::NONE)
-    @sp.read_timeout = 0
-    @sp.flow_control = SerialPort::NONE
     @buf = String.new(encoding: Encoding::ASCII_8BIT)
+    open_serial(path)
   end
 
   def write_raw(bytes)
@@ -394,6 +395,14 @@ class Port
     @sp.close
   rescue StandardError
     # best effort
+  end
+
+  private
+
+  def open_serial(path)
+    @sp = SerialPort.new(path, 115200, 8, 1, SerialPort::NONE)
+    @sp.read_timeout = 0
+    @sp.flow_control = SerialPort::NONE
   end
 end
 
