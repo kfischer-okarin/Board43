@@ -15,6 +15,7 @@
 require 'ws2812-plus'
 require 'gpio'
 require 'pwm'
+require 'eval'
 
 # ================================================================
 # MusicPlayer — byte-decoding monophonic song player
@@ -962,16 +963,16 @@ end
 #
 # Connect a serial terminal (the playground console, `tio`, or
 # `screen /dev/cu.usbmodem*`) and type a line of Ruby + Enter.
-# Lines are compiled and run in a persistent Sandbox that shares
-# globals, top-level constants, and methods with this app, so
-# things like `MainScene::HP_MAX` or `$dbg = scene` work.
+# Lines run via Kernel#eval, which on mruby/c spawns the snippet
+# in a fresh task and returns nil immediately. We side-channel
+# the value (or rescued exception) back through globals and spin
+# on a `done` flag until the spawned task completes.
 #
-# Caveat: a snippet that loops forever will hang the game until
-# you Ctrl-C in the terminal (which raises Interrupt in the
-# sandbox and unblocks Sandbox#wait).
+# Caveat: a snippet that loops forever will hang the game; the
+# eval task is created with preemption disabled, so there's no
+# way to interrupt it from here.
 class LiveRepl
   def initialize
-    @sandbox = Sandbox.new('repl')
     @buf = ''
     puts '[live-repl ready]'
   end
@@ -979,17 +980,21 @@ class LiveRepl
   def tick
     chunk = STDIN.read_nonblock(64)
     return if chunk.nil? || chunk.empty?
-    # Device-side echo: app runs without a tty echoing for it,
-    # so reflect typed bytes back over the same USB CDC.
-    print chunk
-    @buf << chunk
+    # Echo + edit per character: app runs without a tty echoing
+    # for it, so we mirror typed bytes back over the same USB CDC
+    # and intercept BS/DEL so they actually erase from @buf.
+    i = 0
+    len = chunk.length
+    while i < len
+      handle_char(chunk[i])
+      i += 1
+    end
     # Same line-splitting shape as upstream picoruby-shell/pipeline.rb:
     # take 0..idx, then re-bind @buf to the tail. PicoRuby's String
     # has these range slices but not `slice!`.
-    while (idx = @buf.index("\n") || @buf.index("\r"))
+    while (idx = @buf.index("\n"))
       line = (@buf[0..idx] || '').chomp.strip
       @buf = @buf[(idx + 1)..-1] || ''
-      print "\n"
       eval_line(line) unless line.empty?
     end
   rescue => e
@@ -998,25 +1003,42 @@ class LiveRepl
 
   private
 
-  # Wrap user code in begin/rescue so any exception lands in `_`
-  # and comes back as the sandbox result — same trick R2P2's irb
-  # uses (see picoruby-ble-uart/example/ble_irb.rb in upstream).
-  def eval_line(line)
-    wrapped = "begin; _ = (#{line}); rescue => _; end; _"
-    unless @sandbox.compile(wrapped)
-      puts '!! syntax error'
-      return
+  # macOS Terminal sends DEL (0x7f) on backspace; some terminals
+  # send BS (0x08) — handle both. "\b \b" wipes the cell visually
+  # (move left, overwrite with space, move left again).
+  def handle_char(c)
+    case c
+    when "\b", "\x7f"
+      return if @buf.empty?
+      @buf = @buf[0..-2] || ''
+      print "\b \b"
+    when "\r", "\n"
+      @buf << "\n"
+      print "\n"
+    else
+      @buf << c
+      print c
     end
-    @sandbox.execute
-    @sandbox.wait(timeout: nil)
-    @sandbox.suspend
-    r = @sandbox.result
+  end
+
+  # Kernel#eval on mruby/c discards the spawned task's return
+  # value, so we wrap the user line so its result (or rescued
+  # exception) lands in $_repl_result, and flip $_repl_done last
+  # to signal the main task it can read.
+  def eval_line(line)
+    $_repl_result = nil
+    $_repl_done = false
+    eval("begin; $_repl_result = (#{line}); rescue => __e; $_repl_result = __e; end; $_repl_done = true")
+    sleep_ms 5 until $_repl_done
+    r = $_repl_result
     if r.is_a?(Exception)
       puts "!! #{r.message} (#{r.class})"
     else
       puts "=> #{r.inspect}"
     end
-  rescue => e
+  rescue SyntaxError, StandardError => e
+    # SyntaxError raised inline by Kernel#eval is a sibling of
+    # StandardError, not a child, so it slips past a bare `rescue`.
     puts "!! repl(eval): #{e.message} (#{e.class})"
   end
 end
