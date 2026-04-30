@@ -15,9 +15,25 @@
 require 'ws2812-plus'
 require 'gpio'
 require 'pwm'
+require 'eval'
 
-require_relative 'util'
-require_relative 'songs'
+# PicoRuby/R2P2 has no `require_relative` — `require` only resolves
+# statically-registered mrbgems baked into the firmware. So we reach
+# our sibling .rb files through the FAT filesystem and feed them to
+# the `eval` mrbgem. eval spawns a task and returns immediately, so
+# we append a sentinel and spin until it trips — same shape as
+# LiveRepl#eval_line in util.rb.
+def __load_sibling(path)
+  f = File.open(path)
+  src = f.read
+  f.close
+  $__load_done = false
+  eval(src + "\n$__load_done = true\n")
+  sleep_ms 5 until $__load_done
+end
+
+__load_sibling 'util.rb'
+__load_sibling 'songs.rb'
 
 # ================================================================
 # Hazards — self-managed game-world objects
