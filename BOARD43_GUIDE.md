@@ -14,9 +14,7 @@ prior microcontroller experience required.
   - [2.2 The `Board43` module — pin constants](#22-the-board43-module--pin-constants)
   - [2.3 Coming from CRuby — what's different](#23-coming-from-cruby--whats-different)
   - [2.4 Peripheral APIs](#24-peripheral-apis)
-  - [2.5 Standard library — what's available via `require`](#25-standard-library--whats-available-via-require)
-  - [2.6 Worked example — the call chain when you light an LED](#26-worked-example--the-call-chain-when-you-light-an-led)
-  - [2.7 Example apps to read](#27-example-apps-to-read)
+  - [2.5 Example apps to read](#25-example-apps-to-read)
 - [Part 3 — The Execution Environment](#part-3--the-execution-environment)
   - [3.1 R2P2 — what you're talking to over USB](#31-r2p2--what-youre-talking-to-over-usb)
   - [3.2 The shell and built-in commands](#32-the-shell-and-built-in-commands)
@@ -26,9 +24,6 @@ prior microcontroller experience required.
   - [4.1 Workflow A — direct serial terminal](#41-workflow-a--direct-serial-terminal)
   - [4.2 Workflow B — browser playground](#42-workflow-b--browser-playground)
   - [4.3 Workflow C — CLI (`tools/board43.rb`)](#43-workflow-c--cli-toolsboard43rb)
-
-*Below this line: less frequently needed.*
-
 - [Part 5 — Firmware Internals](#part-5--firmware-internals)
   - [5.1 Boot flow on the chip](#51-boot-flow-on-the-chip)
   - [5.2 Full mrbgem inventory](#52-full-mrbgem-inventory)
@@ -41,7 +36,6 @@ prior microcontroller experience required.
 - [Part 7 — PicoModem: protocol reference](#part-7--picomodem-protocol-reference)
 - [Appendix A — libc, HAL, Stubs (the foundational C concepts)](#appendix-a--libc-hal-stubs-the-foundational-c-concepts)
 - [Appendix B — Where Each Concern Lives (jump table)](#appendix-b--where-each-concern-lives-jump-table)
-- [Appendix C — Mental Models to Keep](#appendix-c--mental-models-to-keep)
 
 ---
 
@@ -97,12 +91,7 @@ layer is unpacked later in this guide.
 <!-- markdownlint-enable MD013 -->
 
 Layers 1–6 are bundled into a single `.uf2` file produced by the firmware build
-in [`firmware/`](./firmware). One file, one drag-and-drop, all of it on the
-chip.
-
-If you're here to write apps, head to Part 2 — layers 5–7 are unpacked there and
-in Parts 3–4. Layers 1–4 are firmware-internals territory (Part 5 and Appendix
-A); most app developers never touch them.
+in [`firmware/`](./firmware).
 
 ---
 
@@ -110,10 +99,8 @@ A); most app developers never touch them.
 
 ### 2.1 What's on the board
 
-Board43 = **RP2350A + a fixed peripheral wiring on a PCB.** From a Ruby program
-you address peripherals through the GPIO pin numbers they're soldered to. The
-`Board43` module (§2.2) exports each pin as a constant so you don't sprinkle
-magic numbers through your code.
+From a Ruby program you address peripherals through the GPIO pin numbers they're
+soldered to. The `Board43` module (§2.2) exports each pin as a constant.
 
 <!-- markdownlint-disable MD013 -->
 
@@ -129,8 +116,7 @@ magic numbers through your code.
 
 <!-- markdownlint-enable MD013 -->
 
-That's the whole hardware story. For chip-level details (RP2350 specs, boot ROM
-behavior) see Part 6.
+For chip-level details (RP2350 specs, boot ROM behavior) see Part 6.
 
 ### 2.2 The `Board43` module — pin constants
 
@@ -153,76 +139,56 @@ module Board43
 end
 ```
 
-Pure constants — no methods, no classes. Apps write `Board43::GPIO_LEDOUT`
-instead of literal `24` to keep code readable and pin assignments in one place.
-If the PCB ever respins with different pins, only this module changes.
-
 ### 2.3 Coming from CRuby — what's different
 
-Board43 runs **mruby/c** — a tiny Ruby VM written for embedded use. Most
-idiomatic Ruby works exactly as you'd expect: blocks, iterators, classes,
-modules, mixins, Symbols, Hashes. What follows is the short list of things that
-bite CRuby developers when they first move over.
+Board43 runs **mruby/c**. Most idiomatic Ruby works as expected: blocks,
+iterators, classes, modules, mixins, Symbols, Hashes. The list below is what
+catches CRuby devs out — features that are built into CRuby and need an explicit
+`require` here, or simply aren't available.
 
-**Most stdlib needs an explicit `require`.** In CRuby, `Time` / `JSON` /
-`Base64` / `Marshal` and friends are either built-in or auto-required. Here,
-every module is its own mrbgem. Nothing is loaded by default beyond the language
-core; if your script uses `JSON.parse` you must `require 'json'`. The full
-inventory of what's available is in §5.2.
+**Things CRuby has built-in that need a `require` here.** Full inventory of
+available modules in §5.2.
 
-The frequently-needed ones:
+| Feature                                       | Require              |
+| --------------------------------------------- | -------------------- |
+| `eval`, `instance_eval`                       | `'eval'`             |
+| `Regexp` and regex literals (`/foo/`)         | `'regexp'`           |
+| `Data.define` (CRuby 3.2+)                    | `'data'`             |
+| `Array#pack`, `String#unpack`                 | `'pack'`             |
+| `define_method` and other metaprogramming     | `'metaprog'`         |
+| `Integer#digits`, other numeric extensions    | `'numeric-ext'`      |
 
-```ruby
-require 'json'         # JSON.parse / JSON.generate
-require 'yaml'         # YAML.load / YAML.dump
-require 'base64'       # Base64.encode64 / decode64
-require 'marshal'      # Marshal.dump / Marshal.load
-require 'time'         # Time.now etc.
-require 'data'         # Data.define
-require 'eval'         # yes, eval is opt-in
-require 'pack'         # Array#pack / String#unpack
-require 'numeric-ext'  # extra numeric methods
-require 'logger'       # structured logging
-```
+**`require_relative` is not defined** — only `require` and `load`. Both accept
+absolute paths.
 
-**`require_relative` is not defined.** Only `require` and `load` exist. On
-Board43 there's no current-file context to be relative *to*: the filesystem is
-small and flat, scripts run in a sandboxed namespace, and multi-file Ruby
-projects are rare on-device. If you need to split code across files, push them
-to known absolute paths and `require` or `load` those paths.
+**Regex is a small subset of CRuby's.** Engine source:
+[`picoruby-regexp_light`](https://github.com/picoruby/picoruby/tree/master/mrbgems/picoruby-regexp_light).
+ASCII only.
 
-**Regex requires `require 'regexp'` — and the engine is small.** The mrbgem is
-named `picoruby-regexp_light`, but the **require name is `'regexp'`** (gem name
-and require name differ here — easy to get wrong). The engine implements a
-subset of CRuby regex; complex patterns (lookaround, named groups, Unicode
-property classes) are not supported. Test patterns on-device.
+<!-- markdownlint-disable MD013 -->
 
-**One `ws2812` require, not `ws2812-plus`.** Same trap: the gem is
-`picoruby-ws2812-plus` but you write `require 'ws2812'`.
+| Supported                                  | `.` `?` `*` `+` `{n}` `{n,m}` `{n,}` `^` `$` `\A` `\z` `\Z` `(...)` `[...]` `[a-z]` `\w` `\s` `\d`                                              |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Not supported (silently returns `nil`)** | `\|` (alternation), `*?` `+?` `??` (non-greedy), lookahead/behind, `(?<name>...)` named captures, UTF-8 / multibyte, `\p{…}`, `$~` `$1` globals |
+| **Flags accepted but no-op**               | `i` (case-insensitive), `m` (multiline), `x` (extended)                                                                                         |
+
+<!-- markdownlint-enable MD013 -->
+
+Patterns using unsupported features compile and `match` runs — it just doesn't
+match anything. Test on-device.
 
 **No `Thread`, no `Process`/`fork`.** mruby/c on Board43 runs a single VM task.
-Use cooperative patterns (event loops, polling) or the lower-level task
-primitives in `picoruby-machine` if you need concurrency.
 
-**Networking is inert on Board43.** The networking gembox is built into the
-firmware but Board43 has no Wi-Fi or BT radio. `wifi_connect`, `ping`, etc. are
-present in the shell but won't do anything useful. Don't reach for `net/*` in
-app code.
+**Networking is inert on Board43** — no Wi-Fi or BT radio on the PCB.
+`wifi_connect`, `ping`, and the `net/*` modules are present in the shell/build
+but won't do anything.
 
-**File I/O works, but the filesystem is littlefs on a flash chip.** The usable
-surface is small (roughly a couple of MB), there are no symlinks, and writes
-wear the flash. Treat persistent storage as a precious resource, not a
-scratchpad. See §3.3.
+**File I/O works** (`File.open`, `Dir.foreach`, etc.) on a 512 KB littlefs
+partition. No symlinks. See §3.3.
 
-**`puts` / `print` / `p` go to USB-CDC.** They reach whatever serial terminal
-(or PicoModem-aware client) is connected to the board. There's no separate
-"log file" concept by default.
+**`puts` / `print` / `p` go to stdout**, which is the USB-CDC serial connection.
 
 ### 2.4 Peripheral APIs
-
-Each peripheral is exposed by an mrbgem you must `require`. APIs are
-deliberately CRuby-shaped (kwargs, predicate methods) so reading code feels
-familiar.
 
 <!-- markdownlint-disable MD013 -->
 
@@ -241,73 +207,12 @@ familiar.
 
 <!-- markdownlint-enable MD013 -->
 
-For every one of these, see [`workshop/examples/`](./workshop/examples) for
-working code (§2.7).
+See [`workshop/examples/`](./workshop/examples) for working code (§2.5).
 
-### 2.5 Standard library — what's available via `require`
+### 2.5 Example apps to read
 
-Concise list of generally-useful modules. Full inventory with sources
-in §5.2.
-
-<!-- markdownlint-disable MD013 -->
-
-| Require                  | What you get                                                  |
-| ------------------------ | ------------------------------------------------------------- |
-| `require 'json'`         | `JSON.parse` / `JSON.generate`                                |
-| `require 'yaml'`         | `YAML.load` / `YAML.dump`                                     |
-| `require 'base64'`       | Base64 encode/decode                                          |
-| `require 'base16'`       | Hex encode/decode                                             |
-| `require 'marshal'`      | Object serialization                                          |
-| `require 'data'`         | `Data.define` value-objects (CRuby 3.2+ style)                |
-| `require 'time'`         | `Time.now`, formatting, parsing                               |
-| `require 'pack'`         | `Array#pack` / `String#unpack`                                |
-| `require 'numeric-ext'`  | Extra numeric methods (e.g. `Integer#digits`)                 |
-| `require 'metaprog'`     | Metaprogramming helpers (`define_method` and friends)         |
-| `require 'eval'`         | `eval` and `instance_eval`                                    |
-| `require 'regexp'`       | Subset regex engine (gem name: `picoruby-regexp_light`)       |
-| `require 'logger'`       | Structured logging                                            |
-| `require 'rng'`          | Random number generation                                      |
-| `require 'terminus'`     | Terminal / ANSI escape helpers                                |
-| `require 'machine'`      | `Machine.sleep`, build info, deep sleep, reset, exit          |
-| `require 'watchdog'`     | Hardware watchdog control                                     |
-| `require 'shinonome'`    | Shinonome bitmap font (used for text rendering on LED matrix) |
-| `require 'psg'`          | Programmable Sound Generator + MML parser (chiptune)          |
-| `require 'vram'`         | Frame-buffer / VRAM helper                                    |
-
-<!-- markdownlint-enable MD013 -->
-
-### 2.6 Worked example — the call chain when you light an LED
-
-```ruby
-require 'ws2812'
-
-leds = WS2812.new(pin: Board43::GPIO_LEDOUT, num: 256)
-leds.fill(255, 0, 0).show
-```
-
-What happens underneath:
-
-```text
-Ruby:    WS2812.new(...).fill(255, 0, 0).show
-  ↓ (mruby/c method dispatch)
-C:       ws2812_plus_init() / show() in picoruby-ws2812-plus
-  ↓ (Pico SDK HAL call)
-C:       pio_sm_config_*, pio_sm_set_enabled(), pio_sm_put_blocking(...)
-  ↓ (writes to PIO peripheral registers)
-HW:      RP2350 PIO state machine generates WS2812 bit-stream on GPIO 24
-  ↓ (single-wire 800 kHz protocol)
-LEDs:    256 RGB pixels latch the new color values
-```
-
-The PIO is the trick. WS2812 timing (~1.25 µs per bit) is too tight for software
-bit-banging at any reasonable CPU usage — the RP2040/RP2350 PIO state machines
-bit-bang it in dedicated silicon and the mrbgem hides all of that.
-
-### 2.7 Example apps to read
-
-The workshop directory ([`workshop/examples/`](./workshop/examples)) is the
-canonical reference for the API surface. Each example demonstrates one
-peripheral cleanly:
+[`workshop/examples/`](./workshop/examples) — each example exercises one
+peripheral:
 
 <!-- markdownlint-disable MD013 -->
 
@@ -330,21 +235,18 @@ peripheral cleanly:
 
 ### 3.1 R2P2 — what you're talking to over USB
 
-R2P2 stands for **"Ruby Rapid Portable Platform"** — the firmware's Ruby shell +
-autoloader. It isn't a separate process: it's the **first Ruby script PicoRuby
-runs**, and from your perspective at a serial terminal, it's the program you're
-talking to.
+R2P2 ("Ruby Rapid Portable Platform") is the firmware's Ruby shell + autoloader.
+It is the first Ruby script PicoRuby runs after boot. Source lives upstream at
+[`firmware/picoruby/mrbgems/picoruby-r2p2/`](./firmware/picoruby) (after
+submodule init).
 
-R2P2 lives upstream as a mrbgem inside PicoRuby
-([`firmware/picoruby/mrbgems/picoruby-r2p2/`](./firmware/picoruby) after
-submodule init). Upstream supports four chip targets — `pico` (RP2040), `pico_w`
-(RP2040 + Wi-Fi), `pico2` (RP2350), `pico2_w` (RP2350 + Wi-Fi). Board43 builds
-the **`pico2`** target with the **mruby/c** VM (the "femtoruby" flavor — the
-smaller of the two VMs PicoRuby supports).
+Upstream supports four chip targets — `pico` (RP2040), `pico_w` (RP2040 +
+Wi-Fi), `pico2` (RP2350), `pico2_w` (RP2350 + Wi-Fi). Board43 builds the `pico2`
+target with the mruby/c VM.
 
-What R2P2 gives you, end-to-end:
+R2P2 provides:
 
-- A serial shell over USB-CDC at 115200 8N1 (next subsection).
+- A serial shell over USB-CDC at 115200 8N1 (§3.2).
 - A littlefs filesystem on QSPI flash (§3.3).
 - An autorun hook for `/home/app.rb` plus a hardware escape hatch (§3.4).
 
@@ -381,22 +283,17 @@ The shell also handles a few control-character intercepts at the prompt
 ### 3.3 Filesystem on the board
 
 R2P2 mounts a **littlefs** filesystem on the QSPI flash and labels it `R2P2`.
-From the shell it looks UNIX-shaped:
+The flash chip is a Winbond W25Q32JV (4 MiB total); the user partition is
+**512 KB** (128 × 4096-byte sectors, configured in
+`picoruby-littlefs/ports/rp2040/flash_hal.c`).
 
-- `/home/` — your apps live here. `/home/app.rb` is the autorun target
-  (§3.4).
-- `/etc/` — config / init scripts (`/etc/init.d/r2p2` is the autorun
-  bootstrap).
+Layout under the mount:
+
+- `/home/` — apps live here. `/home/app.rb` is the autorun target (§3.4).
+- `/etc/` — config / init scripts. `/etc/init.d/r2p2` is the autorun bootstrap.
 - `/bin/` — synthetic; resolves to the shell-executable mrbgems.
 
-Constraints worth knowing:
-
-- **Small.** A few MB total — share with firmware, don't hoard.
-- **No symlinks.**
-- **Wear-leveled but finite.** littlefs spreads writes, but tight write-loops on
-  the same path will eventually wear cells. Don't treat flash like RAM.
-- **Power-loss tolerant.** littlefs is journalling; pulling USB mid-write is
-  safe.
+No symlinks. littlefs is journalling and power-loss tolerant.
 
 ### 3.4 Autorun: `/home/app.rb` and the SW3 escape hatch
 
@@ -405,23 +302,20 @@ launch your app. The Board43 patch
 ([`firmware/picoruby.patch:98-167`](./firmware/picoruby.patch)) replaces the
 upstream version with this logic:
 
-1. **Escape hatch:** if **SW3 is held low at boot**, skip autostart entirely.
-   The status LED blinks rapidly 6 times to confirm, then the shell starts
-   normally. This is the "I want to fix a broken app.rb" recovery path.
+1. **Escape hatch:** if **SW3 is held low at boot**, skip autostart. The status
+   LED blinks rapidly 6 times to confirm, then the shell starts normally.
 2. Otherwise, look for an app to load, in this order:
    1. `/home/app.mrb` (precompiled mruby bytecode — faster to load)
    2. `/home/app.rb` (Ruby source — compiled at load time)
    3. Whatever `DFU::BootManager.resolve` returns (DFU / OTA boot managers,
       unused on Board43)
-3. If an app was found, blink the status LED 10 times (visual "loading"
-   indicator), then `load` it with rescues for `Interrupt`, `ScriptError`, and
-   `StandardError` — failures fall through to the shell rather than bricking the
-   device.
-4. If nothing was found, print `"No app found"` and drop straight into the
-   shell.
+3. If an app was found, blink the status LED 10 times, then `load` it with
+   rescues for `Interrupt`, `ScriptError`, and `StandardError` — failures fall
+   through to the shell rather than bricking the device.
+4. If nothing was found, print `"No app found"` and drop into the shell.
 
-Practical implication: **the way to install a "program" on Board43 is to write 
-`/home/app.rb`**. Hold SW3 while plugging in to bypass it.
+Installing a startup program means writing `/home/app.rb`. Hold SW3 at boot to
+bypass.
 
 ---
 
@@ -448,9 +342,6 @@ R2P2> ls /home
 R2P2> vim /home/blink.rb
 R2P2> ./blink.rb
 ```
-
-Good for exploration and one-shot experiments. Bad for git-tracked projects —
-there's no version control story here.
 
 ### 4.2 Workflow B — browser playground
 
@@ -492,15 +383,7 @@ Auto-detects `/dev/cu.usbmodem*`. Uses `bundler/inline` to install the
 
 ---
 
-*Below this line: less frequently needed by app developers.*
-
----
-
 ## Part 5 — Firmware Internals
-
-This is the part to read if you want to know what *actually* runs on the chip
-after flash, what features you have available from Ruby, and what this repo's
-patch changes vs. stock upstream.
 
 ### 5.1 Boot flow on the chip
 
@@ -529,8 +412,6 @@ Boiled down (with the Board43 patch applied), this script:
    `shell.start`.
 
 From step 9 onward you're talking to a Ruby program over USB-CDC at 115200 baud.
-**R2P2 isn't a separate process — it's just the first Ruby script PicoRuby
-runs.** It happens to be a shell.
 
 ### 5.2 Full mrbgem inventory
 
@@ -545,9 +426,8 @@ The build recipe for Board43 lives at
 `firmware/picoruby/mrbgems/*.gembox`) plus three standalone gems, plus the two
 extras added by this repo's patch.
 
-The require name in each table is what you write in `require '…'` — it is
-**not** always the gem name. Empty cells indicate auto-loaded / infrastructure
-gems with no end-user `require`.
+Empty cells in the Require column mean no end-user `require` (auto-loaded by
+R2P2 or invoked as a shell command).
 
 #### From the `minimum` gembox
 
@@ -593,7 +473,7 @@ gems with no end-user `require`.
 | `picoruby-pack`            | `'pack'`            | `Array#pack` / `String#unpack`                 |
 | `picoruby-numeric-ext`     | `'numeric-ext'`     | Standard Ruby numeric extensions ported        |
 | `picoruby-metaprog`        | `'metaprog'`        | Metaprogramming helpers                        |
-| `picoruby-regexp_light`    | `'regexp'`          | Subset regex engine — **note differing name**  |
+| `picoruby-regexp_light`    | `'regexp'`          | Subset regex engine                            |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -658,11 +538,6 @@ This is where Ruby gets to talk to hardware. All wrap Pico SDK HAL calls.
 
 <!-- markdownlint-enable MD013 -->
 
-These two are why the LED matrix and IMU "just work" from Ruby on Board43. Note
-in both cases: **the require name differs from the gem name** — write
-`require 'ws2812'`, not `'ws2812-plus'`; write `require 'lsm6ds3'`, not
-`'picoruby-lsm6ds3'`.
-
 ### 5.3 What this repo's patch adds on top of stock PicoRuby
 
 Everything in this repo's [`firmware/`](./firmware) is a thin wrapper around the
@@ -673,14 +548,11 @@ verbatim during setup and contains five distinct changes:
 
 1. **Two extra mrbgems wired into the build config** — `picoruby-ws2812-plus`
    and `picoruby-lsm6ds3`, the LED-matrix and IMU drivers (patch lines 1–13).
-   Without these, Board43's two most distinctive peripherals would be
-   unreachable from Ruby.
 
 2. **A build-date suffix that includes time + "SB"** in the version string
    (patch lines 14–55). The unmodified upstream stamp is `YYYY-MM-DD`; Board43
    builds report `YYYY-MM-DD HH:MM:SS SB` in the version banner and append `-SB`
-   to the project name in CMake. Lets you tell a Board43 firmware apart from a
-   stock PicoRuby build at a glance.
+   to the project name in CMake.
 
 3. **The `Board43` Ruby module** with all the pin constants (patch lines 56–72).
    Defined directly in `main_task.rb` so it's available globally from the very
@@ -688,17 +560,15 @@ verbatim during setup and contains five distinct changes:
 
 4. **A status-LED-on init in the C boot path** (patch lines 76–95). Stock
    PicoRuby pulls all GPIOs 17–29 to input-pull-down at boot. The patch excludes
-   pin 25 from that loop and explicitly drives it high — so the green status
-   LED lights up the moment the chip boots, before any Ruby has run. Useful as a
-   "yes, the firmware is alive" signal even when the shell hasn't come up yet.
+   pin 25 from that loop and explicitly drives it high, so the status LED lights
+   up the moment the chip boots, before any Ruby has run.
 
 5. **A custom autorun script** (patch lines 96–167) — replaces the stock
    `r2p2.rb` autorun with the Board43 version: SW3 escape hatch, status-LED
    blink before app load, exception rescuing. Discussed in §3.4.
 
-The patch is small (~110 net additions). Everything else — the entire shell, the
-VM, the standard library, the peripheral drivers, R2P2 itself — comes from
-upstream PicoRuby unchanged.
+Net diff: ~110 added lines. Everything else comes from upstream PicoRuby
+unchanged.
 
 ### 5.4 Building from source
 
@@ -808,7 +678,7 @@ flash interface, and a bunch of peripheral controllers. Specs that matter:
 
 - **Dual-core ARM Cortex-M33** at up to 150 MHz (also has dual RISC-V cores;
   firmware picks one ISA at boot)
-- **520 KB SRAM** (yes, kilobytes — total RAM)
+- **520 KB SRAM** total
 - **No internal flash** — flash is an external QSPI chip on the PCB; the chip's
   own flash interface (XIP) makes it look like memory at `0x10000000`
 - **Memory-mapped peripherals** at `0x40000000+` (GPIO, I²C, SPI, UART, PWM,
@@ -816,27 +686,20 @@ flash interface, and a bunch of peripheral controllers. Specs that matter:
 - **USB 1.1 controller** built in
 - **Boot ROM** (a few KB of read-only code burned in at the factory; see §6.2)
 
-Compare to a full Raspberry Pi (Pi 5, etc.): those run Broadcom application
-processors, GBs of RAM, and Linux. **The Pico/Board43 world is a separate
-product line, sharing only the brand name.** Don't conflate them.
+The RP2350 is a microcontroller, not an application processor — distinct from
+the Broadcom-based Raspberry Pi line that runs Linux.
 
 ### 6.2 What's on a freshly-printed board (Boot ROM behavior)
 
-When you receive a freshly-assembled Board43, the QSPI flash is empty. **But
-the chip is not entirely blank** — every RP2350 has a **Boot ROM** burned into
-silicon at manufacturing time, and it does exactly one useful thing on power-on:
+On a freshly-assembled Board43 the QSPI flash is empty. The RP2350 Boot ROM
+(burned into silicon at manufacturing time) does the following on power-on:
 
 > If BOOTSEL is held low (or the flash is empty / corrupt), enumerate over USB
 > as a **mass-storage device** named `RPI-RP2`. Drop a `.uf2` file onto that
 > drive; the Boot ROM writes it to flash and reboots into it.
 
-This is why microcontroller dev kits don't need flashers, JTAG probes, or
-special tools to get started: **the chip is its own flasher over USB.** You just
-need a UF2 file and a USB cable.
-
-The Boot ROM also handles a few other things (secure boot, ROM helper functions
-Pico SDK can call into) but for our purposes its job is "accept a UF2." See §5.5
-for the actual flash procedure.
+The Boot ROM also handles secure boot and exposes ROM helper functions Pico SDK
+can call into. For the actual flash procedure, see §5.5.
 
 ---
 
@@ -847,9 +710,8 @@ on the device side. It's named after XMODEM/YMODEM, but the protocol itself is
 Board43-/PicoRuby-specific. Source on the device:
 [`firmware/picoruby/mrbgems/picoruby-picomodem/mrblib/picomodem.rb`](./firmware/picoruby).
 
-**It's not Ruby-specific.** It's a generic byte-transport with one "execute this
-path" primitive. Could be used to push any file (config, binary, text) to any
-path.
+The protocol is a generic byte-transport with one "execute this path"
+primitive — file content is opaque, not Ruby-specific.
 
 ### 7.1 Two reference implementations in this repo
 
@@ -923,16 +785,16 @@ client                                              device
   │  client verifies CRC-32 matches its own           │
 ```
 
-### 7.6 USB-CDC pacing quirk (32-byte writes ≠ CHUNK size)
+### 7.6 Web Serial pacing quirk (browser only)
 
-This is wire-level USB pacing, applied within each frame — not the same as the
-protocol-level CHUNK in §7.4 (up to 480 bytes per chunk).
+The browser playground writes each frame in **32-byte blocks with a 20 ms gap**
+([`picomodem.ts:28-29`](./playground/src/utils/picomodem.ts): `TX_CHUNK_SIZE`,
+`TX_CHUNK_GAP_MS`). Without this, large writes fail intermittently — the
+constraint sits in the Web Serial / WebUSB stack, not the device.
 
-USB-CDC drops bytes on the floor if you spam too fast. Both implementations send
-in **32-byte blocks with a 20 ms gap** between blocks
-([`picomodem.ts:27-29`](./playground/src/utils/picomodem.ts),
-[`board43.rb:46-47`](./tools/board43.rb)). If you write your own client,
-replicate this — without it, large writes fail intermittently.
+The Ruby CLI ([`tools/board43.rb`](./tools/board43.rb)) writes each 480-byte
+CHUNK in one go with no inter-chunk pacing. Native serial clients generally
+don't need it.
 
 ### 7.7 Integrity
 
@@ -941,18 +803,14 @@ Two layers of checksum:
 - **Per frame**: CRC-16/CCITT covers the framed body
 - **Per file** (write & read): CRC-32 in `DONE_ACK` covers the full file payload
 
-A frame whose CRC-16 doesn't match is rejected as corrupt; a file whose CRC-32
-doesn't match is rejected even if every frame was individually fine. Both layers
-use little-overhead CRCs because that's all USB-CDC needs (it has its own
-link-layer error detection).
+A frame whose CRC-16 doesn't match is rejected; a file whose CRC-32 doesn't
+match is rejected even if every frame was individually fine.
 
 ---
 
 ## Appendix A — libc, HAL, Stubs (the foundational C concepts)
 
-This appendix is the conceptual scaffolding you need to read the firmware
-sources. Skip if you already know it; read it before Part 5 if `libc`, `HAL`, or
-`stubs` aren't familiar terms.
+Conceptual scaffolding for reading the firmware C sources.
 
 ### A.1 libc
 
@@ -1013,12 +871,10 @@ int _write(int fd, char *buf, int len) {
 
 The override happens at **link time**: newlib's defaults are marked as weak
 symbols, the linker prefers Pico SDK's strong definition, and the final binary
-points `printf`'s call site at the real one. **Strategy pattern, wired by the
-linker, not by a runtime DI container.**
+points `printf`'s call site at the real one.
 
-After override, the function is still *called* "the `_write` syscall stub" —
-that's the name of the slot, not a comment on quality. The slot is real, the
-implementation is real, "stub" just stuck around as the name.
+The functions are still called "syscall stubs" once overridden — that's the
+name of the slot, not a comment on the implementation.
 
 ### A.3 HAL (Hardware Abstraction Layer)
 
@@ -1079,14 +935,9 @@ Pico SDK  — provides those stubs + a fat HAL:
 RP2350 silicon (registers at 0x40000000+, 0xD0000000+, …)
 ```
 
-Two parallel concerns sit at the same conceptual level:
-
-- **libc + stubs** is about the C standard API on top of an embedded chip.
-  Abstract things like "write to stdout."
-- **HAL** is about giving Ruby's mrbgems a clean way to poke at hardware.
-  Concrete things like "set GPIO 24 high."
-
-Pico SDK ships both because both are needed; conceptually they're independent.
+libc + stubs and HAL are independent concerns: the first is the C standard API
+on top of an embedded chip, the second wraps the chip's hardware. Pico SDK ships
+both.
 
 ---
 
@@ -1119,26 +970,3 @@ Quick reference for "I want to change X — where do I look?"
 | Workshop examples (canonical API usage) | [`workshop/examples/`](./workshop/examples)                                               |
 
 <!-- markdownlint-enable MD013 -->
-
----
-
-## Appendix C — Mental Models to Keep
-
-If you remember nothing else, remember these:
-
-1. **Board43 = RP2350A + a fixed peripheral wiring on a PCB.** Nothing more,
-   nothing less.
-2. **The Boot ROM makes the chip its own flasher.** No external tools needed to
-   load firmware.
-3. **The firmware is the OS.** R2P2 isn't UNIX-derived — it's UNIX-*shaped* on
-   top of a Ruby VM.
-4. **The Ruby VM is the kernel.** R2P2 runs *inside* PicoRuby, not on top of it
-   — same address space, same binary, same heartbeat.
-5. **libc and HAL are independent concerns** that happen to live next to each
-   other on a microcontroller. libc is the C standard API (newlib for us); HAL
-   (Pico SDK) wraps the chip's hardware. Stubs are the strategy-pattern slot
-   bridging libc to the platform.
-6. **PicoModem = byte transport + one "exec this path" primitive.** Generic, not
-   Ruby-specific.
-7. **The browser playground is just a PicoModem client.** Anything it does, a
-   CLI can do too — `tools/board43.rb` proves it.
