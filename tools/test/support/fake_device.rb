@@ -8,14 +8,13 @@ require 'zlib'
 #   * STX (Ctrl-B) intercept. Echoes "\n^B\n" + ACK and hands off to a
 #     PicoModem session for one operation, then returns to shell mode.
 #   * PicoModem session. Implements FILE_WRITE, FILE_READ, and ABORT
-#     against an in-memory @filesystem hash. Frame parsing matches
-#     picoruby-picomodem (CRC-16/CCITT-FALSE, big-endian length).
+#     against an in-memory @filesystem hash.
 #
 # A FakeDevice is byte-in / byte-out: `feed(bytes)` consumes bytes the
 # client wrote; `consume_outgoing(max)` drains bytes the device has
 # produced for the client to read. The two are decoupled — the device may
-# emit bytes that the client hasn't read yet, just like a real serial
-# line. FakeSerial wires these into write / read_some.
+# emit bytes the client hasn't read yet, just like a real serial line.
+# FakeSerial wires these into write / read_nonblock.
 #
 # Why a Fiber: the device drives the protocol in a straight-line style
 # (read STX, recv frame, loop on chunks…) but its only input is feed —
@@ -26,22 +25,6 @@ require 'zlib'
 # advances the device as far as it can go, then yields.
 
 class FakeDevice
-  STX        = 0x02
-  ACK        = 0x06
-  FILE_READ  = 0x01
-  FILE_WRITE = 0x02
-  CHUNK      = 0x04
-  ABORT      = 0xFF
-  FILE_DATA  = 0x81
-  FILE_ACK   = 0x82
-  CHUNK_ACK  = 0x84
-  DONE_ACK   = 0x8F
-  ERROR      = 0xFE
-  OK         = 0x00
-  READY      = 0x01
-
-  CHUNK_SIZE = 480
-
   attr_reader :io_events, :filesystem
 
   def initialize
@@ -54,8 +37,8 @@ class FakeDevice
     @fiber.resume
   end
 
-  # Consume bytes the client wrote. The device may produce bytes in
-  # response which accumulate in the outgoing buffer; pull them with
+  # Consume bytes the client wrote. Bytes the device produces in
+  # response accumulate in the outgoing buffer; pull them with
   # `consume_outgoing`.
   def feed(bytes)
     @inbuf << bytes.b
@@ -70,17 +53,32 @@ class FakeDevice
     out
   end
 
+  # Block (via Fiber.yield) until exactly n bytes have been fed in, then
+  # return them. PicoModemFrame.read_from_serial! uses this when this
+  # device is the io.
+  def read(n)
+    buf = ''.b
+    while buf.bytesize < n
+      Fiber.yield while @inbuf.empty?
+
+      take = [n - buf.bytesize, @inbuf.bytesize].min
+      buf << @inbuf.byteslice(0, take)
+      @inbuf = @inbuf.byteslice(take..) || ''.b
+    end
+    buf
+  end
+
   private
 
   # ── Top-level loop ────────────────────────────────────────────────────
 
   def run
     loop do
-      byte = read_exact(1).getbyte(0)
+      byte = read(1).getbyte(0)
       case byte
-      when STX        then run_modem_intercept
-      when 0x0D, 0x0A then handle_line_ended
-      else                 @line_buffer << byte
+      when PicoModemFrame::STX then run_modem_intercept
+      when 0x0D, 0x0A          then handle_line_ended
+      else                          @line_buffer << byte
       end
     end
   end
@@ -94,7 +92,7 @@ class FakeDevice
 
   def run_modem_intercept
     emit_bytes("\n^B\n".b)
-    emit_bytes([ACK].pack('C'))
+    emit_bytes([PicoModemFrame::ACK].pack('C'))
     info = run_modem_session
     emit_bytes("\n[PicoModem] #{info}\n$> ".b)
   end
@@ -103,13 +101,12 @@ class FakeDevice
     frame = recv_frame
     return 'timeout' unless frame
 
-    cmd, payload = frame
-    case cmd
-    when FILE_WRITE then handle_file_write(payload)
-    when FILE_READ  then handle_file_read(payload)
-    when ABORT      then 'abort'
+    case frame.cmd
+    when PicoModemFrame::FILE_WRITE then handle_file_write(frame.payload)
+    when PicoModemFrame::FILE_READ  then handle_file_read(frame.payload)
+    when PicoModemFrame::ABORT      then 'abort'
     else
-      send_frame(ERROR, 'Unknown command')
+      send_frame(PicoModemFrame.error('Unknown command'))
       'error'
     end
   end
@@ -118,14 +115,14 @@ class FakeDevice
 
   def handle_file_write(payload)
     if payload.bytesize < 5
-      send_frame(ERROR, 'Invalid FILE_WRITE payload')
+      send_frame(PicoModemFrame.error('Invalid FILE_WRITE payload'))
       return 'error'
     end
 
     total = payload.byteslice(0, 4).unpack1('N')
     path = (payload.byteslice(4..) || ''.b).force_encoding('UTF-8')
     @io_events << [:picomodem, 'FILE_WRITE', path, total]
-    send_frame(FILE_ACK, [READY].pack('C'))
+    send_frame(PicoModemFrame.file_ack)
     receive_chunks_for_write(path, total)
   end
 
@@ -134,20 +131,19 @@ class FakeDevice
     while data.bytesize < total
       frame = recv_frame
       unless frame
-        send_frame(ERROR, 'Timeout receiving chunk')
+        send_frame(PicoModemFrame.error('Timeout receiving chunk'))
         return 'error'
       end
 
-      cmd, payload = frame
-      case cmd
-      when CHUNK
-        @io_events << [:picomodem, 'CHUNK', payload.dup]
-        data << payload
-        send_frame(CHUNK_ACK, [OK].pack('C'))
-      when ABORT
+      case frame.cmd
+      when PicoModemFrame::CHUNK
+        @io_events << [:picomodem, 'CHUNK', frame.payload.dup]
+        data << frame.payload
+        send_frame(PicoModemFrame.chunk_ack)
+      when PicoModemFrame::ABORT
         return 'abort'
       else
-        send_frame(ERROR, 'Unexpected command during transfer')
+        send_frame(PicoModemFrame.error('Unexpected command during transfer'))
         return 'error'
       end
     end
@@ -157,16 +153,18 @@ class FakeDevice
   def finalize_write(path, data)
     @filesystem[path] = data
     @io_events << [:picomodem, 'DONE']
-    send_frame(DONE_ACK, [OK, Zlib.crc32(data)].pack('CN'))
+    send_frame(PicoModemFrame.done_ack(crc32: Zlib.crc32(data)))
     "write #{path}"
   end
 
   # ── FILE_READ ─────────────────────────────────────────────────────────
 
+  CHUNK_SIZE = 480
+
   def handle_file_read(payload)
     path = (payload || ''.b).force_encoding('UTF-8')
     unless @filesystem.key?(path)
-      send_frame(ERROR, "File not found: #{path}")
+      send_frame(PicoModemFrame.error("File not found: #{path}"))
       return 'error'
     end
 
@@ -175,7 +173,7 @@ class FakeDevice
     return 'abort' unless stream_file_data(data)
 
     @io_events << [:picomodem, 'DONE']
-    send_frame(DONE_ACK, [OK, Zlib.crc32(data)].pack('CN'))
+    send_frame(PicoModemFrame.done_ack(crc32: Zlib.crc32(data)))
     "read #{path}"
   end
 
@@ -185,11 +183,10 @@ class FakeDevice
     while offset < data.bytesize
       chunk_size = [CHUNK_SIZE, data.bytesize - offset].min
       chunk = data.byteslice(offset, chunk_size)
-      frame_payload = first ? [data.bytesize].pack('N') + chunk : chunk
+      send_frame(PicoModemFrame.file_data(chunk, total: first ? data.bytesize : nil))
       first = false
-      send_frame(FILE_DATA, frame_payload)
       ack = recv_frame
-      return false unless ack && ack[0] == CHUNK_ACK
+      return false unless ack && ack.cmd == PicoModemFrame::CHUNK_ACK
 
       offset += chunk_size
     end
@@ -199,45 +196,16 @@ class FakeDevice
   # ── Frame I/O ─────────────────────────────────────────────────────────
 
   def recv_frame
-    stx = read_exact(1)
-    return nil unless stx.getbyte(0) == STX
-
-    len = read_exact(2).unpack1('n')
-    body_and_crc = read_exact(len + 2)
-    body = body_and_crc.byteslice(0, len)
-    recv_crc = body_and_crc.byteslice(len, 2).unpack1('n')
-    return nil if crc16(body) != recv_crc
-
-    [body.getbyte(0), body.byteslice(1..) || ''.b]
+    PicoModemFrame.read_from_serial!(self)
+  rescue PicoModemFrame::ProtocolError
+    nil
   end
 
-  def send_frame(cmd, payload = ''.b)
-    body = [cmd].pack('C') + payload.to_s.b
-    emit_bytes([STX, body.bytesize].pack('Cn') + body + [crc16(body)].pack('n'))
-  end
-
-  # Block until @inbuf has n bytes, yielding to the client between feeds.
-  def read_exact(n)
-    Fiber.yield while @inbuf.bytesize < n
-
-    out = @inbuf.byteslice(0, n)
-    @inbuf = @inbuf.byteslice(n..) || ''.b
-    out
+  def send_frame(frame)
+    emit_bytes(frame.to_s)
   end
 
   def emit_bytes(bytes)
     @outbuf << bytes.b
-  end
-
-  def crc16(data)
-    crc = 0xFFFF
-    data.each_byte do |b|
-      crc ^= (b << 8)
-      8.times do
-        crc = (crc & 0x8000).zero? ? (crc << 1) : ((crc << 1) ^ 0x1021)
-        crc &= 0xFFFF
-      end
-    end
-    crc
   end
 end
