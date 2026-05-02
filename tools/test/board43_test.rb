@@ -62,19 +62,46 @@ class Board43Test < Minitest::Test
     end
   end
 
+  def test_push_raises_ack_timeout_when_the_device_does_not_respond_to_stx
+    Tempfile.create(['blink', '.rb']) do |f|
+      f.write("puts :hello\n")
+      f.close
+
+      board = build_silent_board
+
+      assert_raises(Board43::AckTimeout) { board.push([f.path]) }
+    end
+  end
+
   private
 
   def build_board
+    @clock = FakeClock.new
     @device = FakeDevice.new
     @serial = FakeSerial.new(@device)
-    @stdin = StringIO.new
-    @stdout = StringIO.new
-    @logger_io = StringIO.new
     Board43.new(
       serial: @serial,
-      stdin: @stdin,
-      stdout: @stdout,
-      logger_io: @logger_io,
+      stdin: StringIO.new,
+      stdout: StringIO.new,
+      logger_io: StringIO.new,
+      clock: @clock,
     )
+  end
+
+  def build_silent_board
+    @clock = FakeClock.new
+    @serial = FakeSerial.new(SilentDevice.new)
+    Board43.new(
+      serial: @serial,
+      stdin: StringIO.new,
+      stdout: StringIO.new,
+      logger_io: StringIO.new,
+      clock: @clock,
+    )
+  end
+
+  class SilentDevice
+    def feed(_bytes); end
+    def consume_outgoing(_max) = ''.b
   end
 end

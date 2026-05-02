@@ -1,15 +1,21 @@
 require 'zlib'
 
+require_relative 'clock'
 require_relative 'pico_modem_frame'
 
 class Board43
-  CHUNK_SIZE = 512
+  CHUNK_SIZE      = 512
+  ACK_TIMEOUT_S   = 5.0
+  POLL_INTERVAL_S = 0.001
 
-  def initialize(serial:, stdin:, stdout:, logger_io:)
+  AckTimeout = Class.new(StandardError)
+
+  def initialize(serial:, stdin:, stdout:, logger_io:, clock: Clock.new)
     @serial = serial
     @stdin = stdin
     @stdout = stdout
     @logger_io = logger_io
+    @clock = clock
   end
 
   def push(local_paths)
@@ -43,8 +49,14 @@ class Board43
   end
 
   def read_until_ack
+    deadline = @clock.now + ACK_TIMEOUT_S
     loop do
-      return if @serial.read(1).getbyte(0) == PicoModemFrame::ACK
+      raise AckTimeout, "no ACK after #{ACK_TIMEOUT_S}s" if @clock.now > deadline
+
+      bytes = @serial.read_nonblock(64)
+      return if bytes.bytes.include?(PicoModemFrame::ACK)
+
+      @clock.sleep(POLL_INTERVAL_S)
     end
   end
 
