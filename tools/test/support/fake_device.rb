@@ -25,14 +25,19 @@ require 'zlib'
 # advances the device as far as it can go, then yields.
 
 class FakeDevice
-  attr_reader :io_events, :filesystem
+  PROMPT = '$> '.b
+
+  attr_reader :io_events, :filesystem, :shell_mode_stdout
+  attr_writer :emit_prompt
 
   def initialize
     @inbuf = ''.b
     @outbuf = ''.b
+    @shell_mode_stdout = ''.b
     @io_events = []
     @filesystem = {}
     @line_buffer = ''.b
+    @emit_prompt = true
     @fiber = Fiber.new { run }
     @fiber.resume
   end
@@ -73,28 +78,34 @@ class FakeDevice
   # ── Top-level loop ────────────────────────────────────────────────────
 
   def run
+    emit_prompt
     loop do
       byte = read(1).getbyte(0)
       case byte
       when PicoModemFrame::STX then run_modem_intercept
       when 0x0D, 0x0A          then handle_line_ended
-      else                          @line_buffer << byte
+      else
+        @line_buffer << byte
+        emit_bytes(byte.chr.b)
       end
     end
   end
 
   def handle_line_ended
-    return if @line_buffer.empty?
-
-    @io_events << [:shell, :command, @line_buffer.dup]
-    @line_buffer = ''.b
+    emit_bytes("\n".b)
+    unless @line_buffer.empty?
+      @io_events << [:shell, :command, @line_buffer.dup]
+      @line_buffer = ''.b
+    end
+    emit_prompt
   end
 
   def run_modem_intercept
     emit_bytes("\n^B\n".b)
     emit_bytes([PicoModemFrame::ACK].pack('C'))
     info = run_modem_session
-    emit_bytes("\n[PicoModem] #{info}\n$> ".b)
+    emit_bytes("\n[PicoModem] #{info}\n".b)
+    emit_prompt
   end
 
   def run_modem_session
@@ -201,11 +212,20 @@ class FakeDevice
     nil
   end
 
+  # PicoModem frames are binary protocol bytes, not human-readable shell
+  # output — they bypass the shell-mode history.
   def send_frame(frame)
-    emit_bytes(frame.to_s)
+    @outbuf << frame.to_s.b
   end
 
+  # Shell-mode emissions also tee into @shell_mode_stdout so tests can
+  # assert against what a connected terminal would have displayed.
   def emit_bytes(bytes)
     @outbuf << bytes.b
+    @shell_mode_stdout << bytes.b
+  end
+
+  def emit_prompt
+    emit_bytes(PROMPT) if @emit_prompt
   end
 end

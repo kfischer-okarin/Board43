@@ -7,8 +7,11 @@ class Board43
   CHUNK_SIZE      = 512
   ACK_TIMEOUT_S   = 5.0
   POLL_INTERVAL_S = 0.001
+  RUN_PATH        = '/home/run.rb'
+  PROMPT          = '$> '
 
-  AckTimeout = Class.new(StandardError)
+  AckTimeout    = Class.new(StandardError)
+  PromptTimeout = Class.new(StandardError)
 
   def initialize(serial:, stdin:, stdout:, logger_io:, clock: Clock.new)
     @serial = serial
@@ -20,6 +23,12 @@ class Board43
 
   def push(local_paths)
     local_paths.each { |path| upload(path, "/home/#{File.basename(path)}") }
+  end
+
+  def run(local_path)
+    upload(local_path, RUN_PATH)
+    read_until_prompt
+    @serial.write("#{RUN_PATH}\r")
   end
 
   private
@@ -56,6 +65,17 @@ class Board43
       bytes = @serial.read_nonblock(64)
       return if bytes.bytes.include?(PicoModemFrame::ACK)
 
+      @clock.sleep(POLL_INTERVAL_S)
+    end
+  end
+
+  def read_until_prompt
+    deadline = @clock.now + ACK_TIMEOUT_S
+    buf = ''.b
+    until buf.end_with?(PROMPT)
+      raise PromptTimeout, "no '#{PROMPT}' after #{ACK_TIMEOUT_S}s" if @clock.now > deadline
+
+      buf << @serial.read_nonblock(64)
       @clock.sleep(POLL_INTERVAL_S)
     end
   end

@@ -62,6 +62,42 @@ class Board43Test < Minitest::Test
     end
   end
 
+  def test_run_uploads_to_home_run_rb_then_types_the_path_at_the_prompt
+    Tempfile.create(['blink', '.rb']) do |f|
+      f.write("puts :hello\n")
+      f.close
+
+      board = build_board
+
+      board.run(f.path)
+
+      assert_equal [
+        [:picomodem, 'FILE_WRITE', '/home/run.rb', "puts :hello\n".bytesize],
+        [:picomodem, 'CHUNK', "puts :hello\n"],
+        [:picomodem, 'DONE'],
+        [:shell, :command, '/home/run.rb'],
+      ], @device.io_events
+    end
+  end
+
+  def test_run_waits_for_the_shell_prompt_before_typing_the_path
+    Tempfile.create(['blink', '.rb']) do |f|
+      f.write("puts :hello\n")
+      f.close
+
+      board = build_board
+
+      board.run(f.path)
+
+      # On a connected terminal, the last thing visible after `run` is
+      # the prompt with the typed path echoed next to it, then a fresh
+      # prompt waiting for input. If `run` typed before the post-session
+      # prompt arrived, the path would land mid-output and this would
+      # not hold.
+      assert_equal ["$> /home/run.rb\n", '$> '], @device.shell_mode_stdout.lines.last(2)
+    end
+  end
+
   def test_push_raises_ack_timeout_when_the_device_does_not_respond_to_stx
     Tempfile.create(['blink', '.rb']) do |f|
       f.write("puts :hello\n")
@@ -70,6 +106,18 @@ class Board43Test < Minitest::Test
       board = build_silent_board
 
       assert_raises(Board43::AckTimeout) { board.push([f.path]) }
+    end
+  end
+
+  def test_run_raises_prompt_timeout_when_the_device_never_emits_a_prompt
+    Tempfile.create(['blink', '.rb']) do |f|
+      f.write("puts :hello\n")
+      f.close
+
+      board = build_board
+      @device.emit_prompt = false
+
+      assert_raises(Board43::PromptTimeout) { board.run(f.path) }
     end
   end
 
