@@ -1,3 +1,7 @@
 source 'https://rubygems.org'
 
 gem 'serialport'
+
+group :test do
+  gem 'minitest', '~> 6.0'
+end
