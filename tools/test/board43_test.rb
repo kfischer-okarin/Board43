@@ -19,6 +19,25 @@ class Board43Test < Minitest::Test
     end
   end
 
+  def test_push_splits_files_larger_than_the_chunk_size_into_multiple_chunks
+    data = 'x' * 1000
+    Tempfile.create(['big', '.rb']) do |f|
+      f.write(data)
+      f.close
+
+      board = build_board
+
+      board.push([f.path])
+
+      assert_equal [
+        [:picomodem, 'FILE_WRITE', "/home/#{File.basename(f.path)}", 1000],
+        [:picomodem, 'CHUNK', 'x' * 512],
+        [:picomodem, 'CHUNK', 'x' * 488],
+        [:picomodem, 'DONE'],
+      ], @device.io_events
+    end
+  end
+
   private
 
   def build_board

@@ -3,6 +3,8 @@ require 'zlib'
 require_relative 'pico_modem_frame'
 
 class Board43
+  CHUNK_SIZE = 512
+
   def initialize(serial:, stdin:, stdout:, logger_io:)
     @serial = serial
     @stdin = stdin
@@ -21,9 +23,18 @@ class Board43
     handshake
     send_frame(PicoModemFrame.file_write(path: remote_path, size: data.bytesize))
     read_frame
-    send_frame(PicoModemFrame.chunk(data))
+    send_chunks(data)
     read_frame
-    read_frame
+  end
+
+  def send_chunks(data)
+    offset = 0
+    while offset < data.bytesize
+      chunk = data.byteslice(offset, [CHUNK_SIZE, data.bytesize - offset].min)
+      send_frame(PicoModemFrame.chunk(chunk))
+      read_frame
+      offset += chunk.bytesize
+    end
   end
 
   def handshake
