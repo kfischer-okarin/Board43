@@ -22,8 +22,8 @@ class Board43Test < Minitest::Test
   private
 
   def build_board
-    @serial = FakeSerial.new
-    @device = Device.new(@serial)
+    @device = FakeDevice.new
+    @serial = FakeSerial.new(@device)
     @stdin = StringIO.new
     @stdout = StringIO.new
     @logger_io = StringIO.new

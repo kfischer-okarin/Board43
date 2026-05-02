@@ -1,24 +1,21 @@
-# Test-only stand-in for the real Serial wrapper. Front side mirrors the
-# production Serial interface; back side has helpers the Device uses to
-# observe and respond to client traffic.
+# Test-only stand-in for the real Serial wrapper. Wires a FakeDevice in
+# as the other end of the line: each `write` is fed straight into the
+# device, and `read_some` drains whatever the device has produced.
 
 class FakeSerial
   Closed = Serial::Closed
 
-  def initialize
-    @from_device = ''.b
-    @device = nil
+  def initialize(device)
+    @device = device
     @closed = false
   end
-
-  # ── Production interface (matches the real Serial wrapper) ────────────
 
   # Write all bytes to the line. Returns the number of bytes written.
   # Raises Closed if the serial has been closed.
   def write(bytes)
     raise Closed, 'closed serial' if @closed
 
-    @device&.feed(bytes.b)
+    @device.feed(bytes.b)
     bytes.bytesize
   end
 
@@ -29,27 +26,10 @@ class FakeSerial
   def read_some(max = 4096)
     raise Closed, 'closed serial' if @closed
 
-    n = [max, @from_device.bytesize].min
-    out = @from_device.byteslice(0, n)
-    @from_device = @from_device.byteslice(n..) || ''.b
-    out
+    @device.consume_outgoing(max)
   end
 
   def close
     @closed = true
-  end
-
-  # ── Test helpers (used only by Device) ────────────────────────────────
-
-  # Wire up the device that owns the other end of this serial line. With
-  # no device attached, written bytes are silently dropped.
-  def attach_device(device)
-    @device = device
-  end
-
-  # Append bytes the device produced, to be read by the client via
-  # `read_some`. Called by the Device while it processes a feed.
-  def from_device(bytes)
-    @from_device << bytes.b
   end
 end

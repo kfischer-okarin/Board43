@@ -11,15 +11,21 @@ require 'zlib'
 #     against an in-memory @filesystem hash. Frame parsing matches
 #     picoruby-picomodem (CRC-16/CCITT-FALSE, big-endian length).
 #
-# Why a Fiber: Device drives the protocol in a straight-line style
-# (read STX, recv frame, loop on chunks…) but its only input is feed() —
+# A FakeDevice is byte-in / byte-out: `feed(bytes)` consumes bytes the
+# client wrote; `consume_outgoing(max)` drains bytes the device has
+# produced for the client to read. The two are decoupled — the device may
+# emit bytes that the client hasn't read yet, just like a real serial
+# line. FakeSerial wires these into write / read_some.
+#
+# Why a Fiber: the device drives the protocol in a straight-line style
+# (read STX, recv frame, loop on chunks…) but its only input is feed —
 # bytes the client trickled over the line. The Fiber lets us write linear
 # read code; whenever it asks for more bytes than have arrived, it yields
 # and resumes on the next feed. Tests therefore can't deadlock waiting for
 # "the device to do its part" — every byte the client writes synchronously
 # advances the device as far as it can go, then yields.
 
-class Device
+class FakeDevice
   STX        = 0x02
   ACK        = 0x06
   FILE_READ  = 0x01
@@ -38,10 +44,9 @@ class Device
 
   attr_reader :io_events, :filesystem
 
-  def initialize(serial)
-    @serial = serial
-    @serial.attach_device(self)
+  def initialize
     @inbuf = ''.b
+    @outbuf = ''.b
     @io_events = []
     @filesystem = {}
     @line_buffer = ''.b
@@ -49,9 +54,20 @@ class Device
     @fiber.resume
   end
 
+  # Consume bytes the client wrote. The device may produce bytes in
+  # response which accumulate in the outgoing buffer; pull them with
+  # `consume_outgoing`.
   def feed(bytes)
     @inbuf << bytes.b
     @fiber.resume if @fiber.alive?
+  end
+
+  # Return up to `max` bytes the device has produced, consuming them.
+  def consume_outgoing(max)
+    n = [max, @outbuf.bytesize].min
+    out = @outbuf.byteslice(0, n)
+    @outbuf = @outbuf.byteslice(n..) || ''.b
+    out
   end
 
   private
@@ -203,13 +219,14 @@ class Device
   # Block until @inbuf has n bytes, yielding to the client between feeds.
   def read_exact(n)
     Fiber.yield while @inbuf.bytesize < n
+
     out = @inbuf.byteslice(0, n)
     @inbuf = @inbuf.byteslice(n..) || ''.b
     out
   end
 
   def emit_bytes(bytes)
-    @serial.from_device(bytes)
+    @outbuf << bytes.b
   end
 
   def crc16(data)
