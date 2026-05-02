@@ -38,6 +38,30 @@ class Board43Test < Minitest::Test
     end
   end
 
+  def test_push_uploads_each_file_in_its_own_picomodem_session
+    Tempfile.create(['a', '.rb']) do |a|
+      Tempfile.create(['b', '.rb']) do |b|
+        a.write("a\n")
+        a.close
+        b.write("bb\n")
+        b.close
+
+        board = build_board
+
+        board.push([a.path, b.path])
+
+        assert_equal [
+          [:picomodem, 'FILE_WRITE', "/home/#{File.basename(a.path)}", 2],
+          [:picomodem, 'CHUNK', "a\n"],
+          [:picomodem, 'DONE'],
+          [:picomodem, 'FILE_WRITE', "/home/#{File.basename(b.path)}", 3],
+          [:picomodem, 'CHUNK', "bb\n"],
+          [:picomodem, 'DONE'],
+        ], @device.io_events
+      end
+    end
+  end
+
   private
 
   def build_board
