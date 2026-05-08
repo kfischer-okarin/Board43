@@ -31,6 +31,7 @@ class Board43
     upload(local_path, RUN_PATH)
     read_until_prompt
     @serial.write("#{RUN_PATH}\r")
+    shell
   end
 
   def shell

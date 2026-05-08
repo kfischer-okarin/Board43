@@ -69,7 +69,7 @@ class Board43Test < Minitest::Test
 
       board = build_board
 
-      board.run(f.path)
+      handle_stdin { board.run(f.path) }
 
       assert_equal [
         [:picomodem, 'FILE_WRITE', '/home/run.rb', "puts :hello\n".bytesize],
@@ -87,7 +87,7 @@ class Board43Test < Minitest::Test
 
       board = build_board
 
-      board.run(f.path)
+      handle_stdin { board.run(f.path) }
 
       # On a connected terminal, the last thing visible after `run` is
       # the prompt with the typed path echoed next to it, then a fresh
@@ -128,6 +128,23 @@ class Board43Test < Minitest::Test
     shell.resume
 
     refute shell.alive?
+  end
+
+  def test_run_attaches_a_shell_after_typing_the_path
+    Tempfile.create(['blink', '.rb']) do |f|
+      f.write("puts :hello\n")
+      f.close
+
+      board = build_board
+
+      runner = handle_stdin { board.run(f.path) }
+      assert runner.alive?, 'expected run to be in shell attach, not returned'
+
+      @stdin.string = "\x1d"
+      runner.resume
+
+      refute runner.alive?
+    end
   end
 
   def test_run_raises_prompt_timeout_when_the_device_never_emits_a_prompt
