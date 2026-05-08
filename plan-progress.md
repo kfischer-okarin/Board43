@@ -23,9 +23,10 @@ tools/
 │   ├── board43_test.rb       # The centerpiece — drives Board43 through fakes
 │   ├── test_helper.rb
 │   └── support/
-│       ├── fake_clock.rb     # Test double for Clock (advances `now` on sleep)
-│       ├── fake_device.rb    # Test stand-in for a real Board43 + R2P2
-│       └── fake_serial.rb    # Test stand-in for Serial (inherits Serial)
+│       ├── fake_clock.rb         # Test double for Clock (advances `now` on sleep)
+│       ├── fake_device.rb        # Test stand-in for a real Board43 + R2P2
+│       ├── fake_serial.rb        # Test stand-in for Serial (inherits Serial)
+│       └── fiber_fake_stdin.rb   # Fiber-yielding stdin for shell-attach tests
 ├── Gemfile / Gemfile.lock    # `serialport`, `minitest` (test group)
 ├── board43                   # bash wrapper — currently still points at the old board43.rb
 └── board43.rb                # OLD CLI — still in place, untouched. To be replaced
@@ -36,25 +37,43 @@ The old `tools/board43.rb` (the script being rewritten) is *still the
 shipping CLI*. Nothing under `lib/`, `test/`, or `bin/` is wired into the
 `tools/board43` bash wrapper yet. That's the final cutover step.
 
-### Currently working: `push`
+### Currently working: `push`, `run`, `shell`
 
-The new `Board43` class implements one CLI verb so far: `push(local_paths)`
-— uploads each file to `/home/<basename>` via the full PicoModem flow
-(STX/ACK handshake → FILE_WRITE → CHUNK frames → DONE_ACK). 512-byte
-chunks. Multi-file push works (one PicoModem session per file). Raises
-`Board43::AckTimeout` if the device doesn't ACK within 5s.
+- **`push(local_paths)`** — uploads each file to `/home/<basename>` via
+  the full PicoModem flow (STX/ACK handshake → FILE_WRITE → CHUNK
+  frames → DONE_ACK). 512-byte chunks. Multi-file push works (one
+  PicoModem session per file). Raises `Board43::AckTimeout` if the
+  device doesn't ACK within 5s.
+- **`run(local_path)`** — uploads to `/home/run.rb`, scans the device's
+  output for the post-session `$> ` prompt (instead of sleeping a fixed
+  time), types the path + `\r` to exec it, then attaches a shell.
+  Auto-attach is unconditional — there is no `--detach`. Raises
+  `Board43::PromptTimeout` if `$> ` doesn't appear within 5s.
+- **`shell`** — bidirectional pump: bytes from `@stdin` go to the
+  serial; bytes from the serial go to `@stdout` with `\n` → `\r\n`
+  translation (raw mode disables ONLCR). Loops until Ctrl-] (`0x1d`)
+  appears in stdin. Idles via `@clock.sleep(0.005)`. Raw passthrough —
+  the device's `Editor::Line` handles backspace/arrows/Ctrl-A/E/history.
 
 ### Tests that pass
 
-`bundle exec ruby test/board43_test.rb` (from `tools/`) — 4 tests:
+`bundle exec ruby test/board43_test.rb` (from `tools/`) — 9 tests:
 
 1. `test_push_uploads_a_file_to_the_devices_home_directory`
 2. `test_push_splits_files_larger_than_the_chunk_size_into_multiple_chunks`
 3. `test_push_uploads_each_file_in_its_own_picomodem_session`
 4. `test_push_raises_ack_timeout_when_the_device_does_not_respond_to_stx`
+5. `test_run_uploads_to_home_run_rb_then_types_the_path_at_the_prompt`
+6. `test_run_waits_for_the_shell_prompt_before_typing_the_path`
+7. `test_run_attaches_a_shell_after_typing_the_path`
+8. `test_run_raises_prompt_timeout_when_the_device_never_emits_a_prompt`
+9. `test_shell_displays_device_output_for_a_typed_command`
 
-All assertions go through `@device.io_events` — a list of high-level
-protocol events the FakeDevice records as it parses incoming frames.
+Push tests assert against `@device.io_events` (high-level protocol
+event log). Shell-mode tests assert against `@stdout.string` (what a
+connected terminal would render) or `@device.shell_mode_stdout` (the
+device's view of what it would have printed in shell mode, frames
+excluded).
 
 ---
 
@@ -79,9 +98,9 @@ was explicit on this.
   after `close`.
 
 `FakeSerial < Serial` overrides only `initialize`, `write`, `read_nonblock`,
-`close` — inherits `read` and `Closed`. This is intentional: we want the
-test fake to share the *blocking* read implementation so any difference
-between fake and real is concentrated in `read_nonblock`.
+`close` — inherits `read` and `Closed`. Intentional: tests share the
+*blocking* read implementation so any difference between fake and real
+is concentrated in `read_nonblock`.
 
 The 1ms poll-sleep inside `Serial#read` is **not** mocked. Okarin's call:
 short enough not to matter in tests, mocking it would just confuse things.
@@ -133,15 +152,50 @@ Raises:
 - `PicoModemFrame::ProtocolError` — first byte wasn't STX
 - `PicoModemFrame::CrcMismatchError < ProtocolError` — CRC-16 didn't match
 
-### `FakeDevice` — Fiber-driven, faithful PicoModem implementation
+### Shell pump — fiber-friendly without leaking fibers into production
 
-The most complex test fake. Implements:
-- Shell-mode line input (CR/LF "executes" the line as a `[:shell, :command, ...]` event)
-- STX intercept: emits `\n^B\n\x06` (matching `shell.rb`'s actual byte sequence — see "Protocol details" below) and runs one PicoModem session
-- FILE_WRITE handler with chunking + DONE_ACK + CRC32
-- FILE_READ handler that streams from `@filesystem`
-- ABORT handling
-- Session epilogue: `\n[PicoModem] write /path\n$> ` after each operation
+`Board43#shell` is a plain nonblocking loop that:
+1. Drains the serial outbox to `@stdout` (with `\n`→`\r\n` translation).
+2. Reads `@stdin` non-blockingly. If a chunk contains `0x1d`, forwards
+   bytes up to it, drains once more, and returns. Otherwise forwards
+   the chunk verbatim.
+3. Idles via `@clock.sleep(SHELL_IDLE_S)` (0.005s) when both sides have
+   nothing to do.
+
+In production the `@stdin` is a real IO whose `read_nonblock(_, exception:
+false)` returns `:wait_readable` when the user hasn't typed — the loop
+just sleeps and retries. No fiber, nothing exotic. In tests the stdin is
+`FiberFakeStdin` whose `read_nonblock` calls `Fiber.yield` while its
+buffer is empty, so the test driving the pump from a Fiber gets control
+back as soon as the pump is idle on input. The `sleep` line is unreachable
+in tests because `FiberFakeStdin` yields first.
+
+This was the result of explicit design pressure from Okarin: production
+must not pay for test ergonomics.
+
+### `FakeDevice` — Fiber-driven, faithful PicoModem + shell implementation
+
+The most complex test fake. Implements a believable slice of R2P2:
+
+- **Shell-mode line input.** Bytes typed at the prompt accumulate into a
+  line buffer; CR/LF "executes" the line (`[:shell, :command, line]`
+  io_event), emits `\n`, and the device returns to a fresh `$> `.
+  Programmable per-command responses via `command_responses['greet'] =
+  "hello world\n"` (used by the shell-display test).
+- **Boot prompt.** The fiber emits `$> ` as the first thing it does, so
+  on startup the host sees the prompt without any prodding.
+- **Char echo.** Every typed char is echoed back to `@outbuf`, like the
+  real device's `Editor::Line` does on each refresh.
+- **STX intercept.** Echoes `\n^B\n\x06` (matching `shell.rb`'s actual
+  byte sequence — see "Protocol details" below) and runs one PicoModem
+  session.
+- **Session epilogue.** After the session, emits `\n[PicoModem] info\n`
+  and a fresh `$> `.
+- **PicoModem session.** Implements FILE_WRITE, FILE_READ, and ABORT
+  against an in-memory `@filesystem` hash.
+- **Suppression.** `attr_writer :emit_prompt` — set to `false` to
+  silence all prompt emissions (boot, post-command, post-session).
+  Used by the prompt-timeout test.
 
 **Why a Fiber:** the device drives the protocol in straight-line style
 (read STX → recv frame → loop on chunks → ...) but its only input is
@@ -152,8 +206,9 @@ its part" — every byte the client writes synchronously advances the
 device as far as it can go, then yields.
 
 **Public interface:** `feed(bytes)`, `consume_outgoing(max)`, `read(n)`,
-plus introspection accessors `io_events` and `filesystem`. The `read(n)`
-is what `PicoModemFrame.read_from_serial!(self)` calls.
+plus introspection accessors `io_events`, `filesystem`, `shell_mode_stdout`,
+and writers `emit_prompt`, `command_responses`. `read(n)` is what
+`PicoModemFrame.read_from_serial!(self)` calls.
 
 **`io_events` event vocabulary** (current, may grow):
 - `[:picomodem, 'FILE_WRITE', path, size]`
@@ -161,6 +216,13 @@ is what `PicoModemFrame.read_from_serial!(self)` calls.
 - `[:picomodem, 'DONE']` — multi-frame op completed
 - `[:picomodem, 'FILE_READ', path]`
 - `[:shell, :command, line]` — line typed at the shell prompt (CR/LF terminated)
+
+**`shell_mode_stdout` accumulator.** Mirrors what a connected terminal
+would have rendered in shell mode. Every shell-side `emit_bytes` tees
+into it; PicoModem frames go straight to `@outbuf` via `send_frame` and
+bypass it. So tests can assert *"the user saw `$> /home/run.rb` then a
+fresh `$> `"* on the last two lines, instead of asserting brittle
+byte-exact concatenations.
 
 ### `FakeSerial` — accumulating outbox, byte-in/byte-out device
 
@@ -173,15 +235,42 @@ Earlier sketch had `feed(bytes)` *return* the response bytes, but Okarin
 correctly flagged that this forecloses on async/spontaneous emit
 scenarios (boot banner, app stdout while attached in `shell` mode).
 
-### Clock injection — only in `Board43`, only for deadline checks
+### `FiberFakeStdin` — fiber-yielding test stdin
+
+`read_nonblock(_, exception: false)` calls `Fiber.yield` while the
+internal buffer is empty. The test sets `string=` and resumes the
+wrapping fiber to feed the next bytes. Mirrors `FakeDevice`'s
+"feed-and-resume" model so shell tests read as a back-and-forth:
+
+```ruby
+shell = handle_stdin { board.shell }   # starts the fiber, runs to first idle
+assert_equal '$> ', @stdout.string
+
+@stdin.string = "greet\r"
+shell.resume
+assert_equal "$> greet\r\nhello world\r\n$> ", @stdout.string
+
+@stdin.string = "\x1d"
+shell.resume
+refute shell.alive?
+```
+
+The `handle_stdin` test helper is a one-liner that does
+`Fiber.new(&block).tap(&:resume)`. The first resume is built in so the
+test reads as a single setup line, not two.
+
+### Clock injection — only in `Board43`, only for deadline checks and idle sleeps
 
 Okarin: don't inject the clock into `Serial`. The 1ms poll-sleep there
 is short enough not to bother tests. Mocking it would be confusing.
 
 In `Board43`:
-- `read_until_ack` uses `@clock.now > deadline` to bail with `AckTimeout`
+- `read_until_ack` / `read_until_prompt` use `@clock.now > deadline`
+  to bail with `AckTimeout` / `PromptTimeout`.
 - `@clock.sleep(POLL_INTERVAL_S)` between polls — `FakeClock.sleep`
-  advances `@now` so the timeout test runs in zero wall-clock time
+  advances `@now` so timeout tests run in zero wall-clock time.
+- `@clock.sleep(SHELL_IDLE_S)` for the shell pump's idle. Only reached
+  in production; in tests `FiberFakeStdin` yields first.
 
 ### Step-down ordering everywhere
 
@@ -195,6 +284,19 @@ worth ordering).
 
 Okarin's style preference. Applied throughout. Helps the eye see the
 guard clauses.
+
+### Decisions explicitly NOT taken
+
+- **No local line editing in `shell`.** The device's `Editor::Line`
+  already handles backspace/Del (8, 127), left/right (`ESC[CD]`),
+  up/down history (`ESC[AB]`), Ctrl-A/E (head/tail), Ctrl-L (refresh),
+  Tab. Alt-prefixed sequences (Alt-F/B word jumps, Alt-Backspace) are
+  NOT handled by the device — they currently produce a literal letter
+  insert, since `Editor::Line` re-prepends unknown ESC tails. Living
+  with that for now; revisit only if it becomes painful on hardware.
+- **No `--detach` for `run`.** Auto-attach is unconditional.
+- **No `Fiber.yield` in `Board43#shell` itself.** The yield lives in
+  `FiberFakeStdin`; production stays fiber-free.
 
 ---
 
@@ -226,7 +328,17 @@ FILE_WRITE cycles.
 and prints `[PicoModem] info\n` (e.g. `[PicoModem] write /home/foo\n`)
 then re-displays the `$> ` prompt. These bytes sit in the buffer until
 the next operation reads them (or until they're scanned past during
-`read_until_ack` for the next session).
+`read_until_ack` for the next session). `Board43#run` consumes them
+explicitly with `read_until_prompt` before typing the path, so the
+typed path lands while the shell is ready to read.
+
+**No `RUN_FILE`.** The TS playground defines `RUN_FILE = 0x07` and a
+`runFile()` method, but **nothing calls it** and the device firmware
+has no handler for it (`picomodem.rb`'s case-statement falls through to
+`Unknown command`). Both the playground "Run on device" button and our
+`run` verb upload via `FILE_WRITE`, then drop back to the shell and type
+the path + `\r`. That's the only thing that actually works against
+current firmware.
 
 **Chunk sizes.**
 - Device-side `CHUNK_SIZE = 480` (`picomodem.rb:38`) — used **only**
@@ -255,48 +367,33 @@ STX.
 
 ## What's left
 
-These haven't been started. Ordered by dependency.
+Two items, in dependency order. Nothing else is in scope.
 
-### 1. Remaining `Board43` verbs
+### 1. `install <local>`
 
-The original `tools/board43.rb` has these subcommands:
+Upload-only: `Board43#install(local_path)` uploads the file to
+`/home/app.rb` (R2P2 autoruns this on boot via the patched
+`shell_executables/r2p2.rb`). No flags. If the user wants to run it
+right away, they can use `run`. If they want to validate boot behavior,
+they reset the device.
 
-- **`run <local>`** — upload to `/home/run.rb`, exec it (the existing
-  CLI types the path + `\r` into the shell prompt rather than using
-  `RUN_FILE`), then attach a raw shell. `--detach` skips the attach.
-- **`install <local>`** — upload to `/home/app.rb` (R2P2 autoruns this
-  on boot). `--run` triggers it immediately.
-- **`shell`** — pure raw-terminal attach to the live device; Ctrl-]
-  detaches.
+Scope: one method, one or two tests at the application level (file
+ends up on the device's filesystem at `/home/app.rb`).
 
-The current `tools/board43.rb`'s `run`, `install`, and `shell` workflows
-are documented in its own header comment — that's the spec for what the
-new code should do. Read it before starting.
-
-The shell-attach part (raw terminal, Ctrl-] detection, LF→CRLF translation
-for the user terminal) is non-trivial. Probably wants to live in a
-small `ShellPilot` class or similar. It's the one place `stdin` /
-`stdout` get used as actual terminal IO, not just for tests.
-
-For tests, `FakeDevice` already records `[:shell, :command, line]` events,
-so `run` and `install --run` can be asserted on those. `shell` itself is
-trickier — would need a test that pumps fake stdin bytes and checks they
-reach the device + that device output flows to fake stdout.
-
-### 2. CLI entry point
+### 2. CLI entry point + cutover
 
 A new file (probably `lib/cli.rb`) that:
-- Parses argv with OptionParser (matching the existing flag set:
-  `-p PATH`, `--run`, `--detach`, `-h`)
-- Auto-detects `/dev/cu.usbmodem*` if no `-p`
-- Constructs a real `Serial`, `Board43.new(serial:, ...)`, dispatches.
+- Parses argv with OptionParser. Flag set is now smaller than before:
+  `-p PATH`, `-h`. (No `--run`, no `--detach`.)
+- Auto-detects `/dev/cu.usbmodem*` if no `-p`.
+- Constructs a real `Serial`, `Board43.new(serial:, stdin: $stdin,
+  stdout: $stdout, logger_io: $stderr)`, dispatches to one of `push`,
+  `install`, `run`, `shell`.
 
 The new `tools/board43.rb` script (replacing the old one) should be
 ~10 lines: require the lib, call `Cli.run(ARGV, ...)`, exit 0.
 
-### 3. Cutover
-
-Once everything works:
+Cutover steps:
 - Replace the old `tools/board43.rb` with the new entry point.
 - The existing `tools/board43` bash wrapper already invokes
   `bundle exec ruby tools/board43.rb` — no change needed there.
@@ -305,27 +402,7 @@ Once everything works:
   shell-attach code path though — the doc string in the existing
   `wait_for_prompt` has useful advice about why we don't auto-Ctrl-C.)
 
-### 4. Probably worth adding eventually
-
-Not blocking the rewrite, but in the design's reach:
-
-- **`pull <remote> [local]`** — uses `PicoModemFrame.file_read`. The
-  guide actually documents this as already supported in the CLI;
-  somebody promised it ahead of implementation. `FakeDevice` already
-  implements the device side.
-- **`rm <remote>`** — uses `DELETE_FILE`. Not yet in `PicoModemFrame`;
-  would just be one factory method + handling.
-- **Frame-level read timeout.** `PicoModemFrame.read_from_serial!`
-  blocks indefinitely if the device goes silent mid-frame. The ACK
-  timeout we have only covers the handshake. For real hardware
-  robustness, frame reads should also have a deadline. The Clock
-  abstraction is already there; it's a small change.
-- **`CrcMismatchError` recovery.** Currently propagates as an unhandled
-  exception out of `read_frame`. Real picomodem.rb just bails the
-  session on CRC mismatch — fine, but the CLI should turn it into a
-  user-visible error message rather than a stack trace.
-
-### 5. Lower-level unit tests, when they earn their place
+### Lower-level unit tests, when they earn their place
 
 Per the `software-design` skill: only when a sub-module needs to be
 *resilient* (handles many edge cases specific to its subdomain) or
@@ -346,11 +423,20 @@ bundle exec ruby test/board43_test.rb       # run the test
 ```
 
 To add a new test: add a method to `Board43Test`. `build_board` gives
-you a `Board43` wired to a `FakeDevice` + `FakeSerial` + `FakeClock`.
-Use `@device.io_events` for protocol-level assertions and
-`@device.filesystem` for "what files ended up on the device" assertions.
-`build_silent_board` is the variant for timeout testing — substitutes a
-`SilentDevice` that ignores all input and never responds.
+you a `Board43` wired to a `FakeDevice` + `FakeSerial` + `FakeClock` +
+`FiberFakeStdin`. Use `@device.io_events` for protocol-level assertions
+and `@device.filesystem` for "what files ended up on the device"
+assertions. `@device.shell_mode_stdout` is the device's view of what a
+real terminal would have rendered in shell mode (frames excluded).
+`build_silent_board` is the variant for `AckTimeout` testing —
+substitutes a `SilentDevice` that ignores all input and never responds.
+For `PromptTimeout` testing, use `build_board` then
+`@device.emit_prompt = false`.
+
+For shell-attach tests, wrap the shell-driving code with the
+`handle_stdin { ... }` helper (creates a Fiber, runs to first idle).
+Then mutate `@stdin.string` and call `.resume` on the returned fiber to
+feed the next bytes.
 
 For a "device emits something the test should see" scenario that
 **doesn't** map to client→server flow (e.g. a boot banner, an app's
@@ -375,6 +461,14 @@ on `FakeDevice` like `simulate_emit(bytes)` that just appends to
 - `class << self` for class methods, with `private` inside if needed.
 - Don't over-mock: only what tests genuinely need (Clock yes, internal
   Serial sleep no).
+- Production must not pay for test ergonomics — fiber-yield logic lives
+  in `FiberFakeStdin`, not in `Board43#shell`.
+- Prefer behavioral assertions (`shell_mode_stdout` last-two-lines)
+  over byte-level structural ones (`consume_outgoing == ''`).
+- Don't preemptively terminate fibers in tests "for cleanliness" if they
+  GC fine — only when it makes the test clearer.
+- Helpers like `handle_stdin` should fold setup ceremony in (here, the
+  initial `.resume`) rather than expose it.
 - Personal apps go in `my-apps/`, not `workshop/examples/` (from memory —
   not relevant to this rewrite, but came up before).
 
@@ -386,9 +480,13 @@ on `FakeDevice` like `simulate_emit(bytes)` that just appends to
   `lib-checkouts/picoruby/mrbgems/picoruby-picomodem/mrblib/picomodem.rb`
 - Upstream shell STX intercept:
   `lib-checkouts/picoruby/mrbgems/picoruby-shell/mrblib/shell.rb:417-422`
+- Upstream line editor (handles backspace, arrows, Ctrl-A/E, history):
+  `lib-checkouts/picoruby/mrbgems/picoruby-editor/mrblib/editor.rb` —
+  `Editor::Line` (line 103+)
 - Reference wasm client (where 512 came from):
   `lib-checkouts/picoruby/mrbgems/picoruby-wasm/demo/www/terminal.html:190`
 - Original Ruby CLI being rewritten (still the shipping one):
   `tools/board43.rb`
 - TS reference implementation: `playground/src/utils/picomodem.ts`
+  (note: its `runFile()` is dead code; no firmware support)
 - Protocol overview: `BOARD43_GUIDE.md` Part 7
