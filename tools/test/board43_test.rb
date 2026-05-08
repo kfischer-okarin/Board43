@@ -121,7 +121,10 @@ class Board43Test < Minitest::Test
     @stdin.string = "greet\r"
     shell.resume
 
-    assert_equal "$> greet\nhello world\n$> ", @stdout.string
+    # Bare \n from the device gets translated to \r\n before stdout —
+    # the user's terminal is in raw mode (no ONLCR), so without this it
+    # would render staircased.
+    assert_equal "$> greet\r\nhello world\r\n$> ", @stdout.string
 
     @stdin.string = "\x1d"
     shell.resume

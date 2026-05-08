@@ -57,7 +57,13 @@ class Board43
 
   def drain_serial_to_stdout
     bytes = @serial.read_nonblock(4096)
-    @stdout.write(bytes) unless bytes.empty?
+    return if bytes.empty?
+
+    # Raw mode disables ONLCR, so bare \n from the device moves the
+    # cursor down without returning to column 0. Translate to \r\n so
+    # output renders correctly on a real terminal. (Doubling on \r\n
+    # already in the stream is harmless.)
+    @stdout.write(bytes.gsub("\n", "\r\n"))
   end
 
   def read_stdin_or_nil
