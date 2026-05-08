@@ -28,6 +28,7 @@ class FakeDevice
   PROMPT = '$> '.b
 
   attr_reader :io_events, :filesystem, :shell_mode_stdout
+  attr_accessor :command_responses
   attr_writer :emit_prompt
 
   def initialize
@@ -37,6 +38,7 @@ class FakeDevice
     @io_events = []
     @filesystem = {}
     @line_buffer = ''.b
+    @command_responses = {}
     @emit_prompt = true
     @fiber = Fiber.new { run }
     @fiber.resume
@@ -95,6 +97,8 @@ class FakeDevice
     emit_bytes("\n".b)
     unless @line_buffer.empty?
       @io_events << [:shell, :command, @line_buffer.dup]
+      response = @command_responses[@line_buffer]
+      emit_bytes(response.b) if response
       @line_buffer = ''.b
     end
     emit_prompt

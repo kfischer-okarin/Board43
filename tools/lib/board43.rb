@@ -7,8 +7,10 @@ class Board43
   CHUNK_SIZE      = 512
   ACK_TIMEOUT_S   = 5.0
   POLL_INTERVAL_S = 0.001
+  SHELL_IDLE_S    = 0.005
   RUN_PATH        = '/home/run.rb'
   PROMPT          = '$> '
+  SHELL_EXIT_KEY  = 0x1d
 
   AckTimeout    = Class.new(StandardError)
   PromptTimeout = Class.new(StandardError)
@@ -31,7 +33,37 @@ class Board43
     @serial.write("#{RUN_PATH}\r")
   end
 
+  def shell
+    loop do
+      drain_serial_to_stdout
+      bytes = read_stdin_or_nil
+      if bytes && !bytes.empty?
+        if (idx = bytes.bytes.index(SHELL_EXIT_KEY))
+          pre_exit = bytes.byteslice(0, idx)
+          @serial.write(pre_exit) unless pre_exit.empty?
+          drain_serial_to_stdout
+          return
+        end
+
+        @serial.write(bytes)
+        next
+      end
+
+      @clock.sleep(SHELL_IDLE_S)
+    end
+  end
+
   private
+
+  def drain_serial_to_stdout
+    bytes = @serial.read_nonblock(4096)
+    @stdout.write(bytes) unless bytes.empty?
+  end
+
+  def read_stdin_or_nil
+    bytes = @stdin.read_nonblock(64, exception: false)
+    bytes.is_a?(String) ? bytes : nil
+  end
 
   def upload(local_path, remote_path)
     data = File.binread(local_path)

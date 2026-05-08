@@ -109,6 +109,26 @@ class Board43Test < Minitest::Test
     end
   end
 
+  def test_shell_displays_device_output_for_a_typed_command
+    board = build_board
+    @device.command_responses['greet'] = "hello world\n"
+
+    shell = Fiber.new { board.shell }
+    shell.resume
+
+    assert_equal '$> ', @stdout.string
+
+    @stdin.string = "greet\r"
+    shell.resume
+
+    assert_equal "$> greet\nhello world\n$> ", @stdout.string
+
+    @stdin.string = "\x1d"
+    shell.resume
+
+    refute shell.alive?
+  end
+
   def test_run_raises_prompt_timeout_when_the_device_never_emits_a_prompt
     Tempfile.create(['blink', '.rb']) do |f|
       f.write("puts :hello\n")
@@ -127,10 +147,12 @@ class Board43Test < Minitest::Test
     @clock = FakeClock.new
     @device = FakeDevice.new
     @serial = FakeSerial.new(@device)
+    @stdin = FiberFakeStdin.new
+    @stdout = StringIO.new
     Board43.new(
       serial: @serial,
-      stdin: StringIO.new,
-      stdout: StringIO.new,
+      stdin: @stdin,
+      stdout: @stdout,
       logger_io: StringIO.new,
       clock: @clock,
     )
