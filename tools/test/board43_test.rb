@@ -113,9 +113,7 @@ class Board43Test < Minitest::Test
     board = build_board
     @device.command_responses['greet'] = "hello world\n"
 
-    shell = Fiber.new { board.shell }
-    shell.resume
-
+    shell = handle_stdin { board.shell }
     assert_equal '$> ', @stdout.string
 
     @stdin.string = "greet\r"
@@ -145,6 +143,17 @@ class Board43Test < Minitest::Test
   end
 
   private
+
+  # Wrap a block that reads from @stdin in a Fiber so that
+  # FiberFakeStdin's yield-on-empty-buffer has a non-root fiber to
+  # return to. The fiber is started before this returns — it runs until
+  # it first yields on empty stdin. Mutate @stdin.string and call
+  # .resume on the returned fiber to drive subsequent input.
+  def handle_stdin(&block)
+    fiber = Fiber.new(&block)
+    fiber.resume
+    fiber
+  end
 
   def build_board
     @clock = FakeClock.new
